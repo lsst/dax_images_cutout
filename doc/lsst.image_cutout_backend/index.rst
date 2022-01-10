@@ -6,7 +6,8 @@
 lsst.image_cutout_backend
 #########################
 
-.. Paragraph that describes what this Python module does and links to related modules and frameworks.
+This package provides tasks that extract subsets of LSST image datasets to back an IVOA image cutout service.
+
 
 .. .. _lsst.image_cutout_backend-using:
 
