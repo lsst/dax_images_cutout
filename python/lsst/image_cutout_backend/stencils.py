@@ -42,6 +42,7 @@ import lsst.sphgeom
 import numpy as np
 from lsst.afw.geom import SkyWcs, SpanSet, linearizeTransform, makeCdMatrix, makeSkyWcs, makeWcsPairTransform
 from lsst.afw.image import Mask
+from lsst.daf.base import PropertyList
 from lsst.geom import Angle, Box2I, Point2D, SpherePoint, radians
 
 
@@ -182,6 +183,17 @@ class SkyStencil(ABC):
         """A `lsst.sphgeom.Region` that bounds this stencil on the sky."""
         raise NotImplementedError()
 
+    @abstractmethod
+    def to_fits_metadata(self, metadata: PropertyList) -> None:
+        """Write FITS header entries that describe the stencil.
+
+        Parameters
+        ----------
+        metadata : `PropertyList`
+            Metadata, to be modified in place.
+        """
+        raise NotImplementedError()
+
 
 class SkyCircle(SkyStencil):
     """A sky-coordinate circular stencil.
@@ -298,6 +310,13 @@ class SkyCircle(SkyStencil):
             self._center.getVector(), lsst.sphgeom.Angle.fromRadians(self._radius.asRadians())
         )
 
+    def to_fits_metadata(self, metadata: PropertyList) -> None:
+        # Docstring inherited.
+        metadata.set("ST_TYPE", "CIRCLE", "Type of stencil used to create this cutout.")
+        metadata.set("ST_RA", self._center.getRa().asDegrees(), "Circle center right ascension in degrees.")
+        metadata.set("ST_DEC", self._center.getDec().asDegrees(), "Circle center declination in degrees.")
+        metadata.set("ST_RAD", self._radius.asDegrees(), "Circle radius in degrees.")
+
 
 class SkyPolygon(SkyStencil):
     """A sky-coordinate stencil in the shape of a great-circle polygon.
@@ -370,6 +389,17 @@ class SkyPolygon(SkyStencil):
     def region(self) -> lsst.sphgeom.Region:
         # Docstring inherited.
         return lsst.sphgeom.ConvexPolygon([v.getVector() for v in self._vertices])
+
+    def to_fits_metadata(self, metadata: PropertyList) -> None:
+        # Docstring inherited.
+        metadata.set("ST_TYPE", "POLYGON", "Type of stencil used to create this cutout.")
+        if len(self._vertices) > 100:
+            raise NotImplementedError(
+                "TODO: FITS limitations make it difficult to serialize big stencils to the header."
+            )
+        for n, v in enumerate(self._vertices):
+            metadata.set(f"ST_RA{n:02d}", v.getRa().asDegrees(), f"Vertex {n} right ascension in degrees.")
+            metadata.set(f"ST_DEC{n:02d}", v.getDec().asDegrees(), f"Vertex {n} declination in degrees.")
 
 
 def _angle_from_astropy(angle: astropy.coordinates.Angle) -> Angle:
