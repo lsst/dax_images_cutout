@@ -31,7 +31,9 @@ __all__ = (
     "StencilNotContainedError",
 )
 
+import struct
 from abc import ABC, abstractmethod
+from hashlib import blake2b
 from typing import Iterable, Optional
 
 import astropy.coordinates
@@ -194,6 +196,15 @@ class SkyStencil(ABC):
         """
         raise NotImplementedError()
 
+    @property
+    @abstractmethod
+    def fingerprint(self) -> bytes:
+        """A 16-byte blob that is unique to this stencil.
+
+        This may be a hash or a reversible encoding.
+        """
+        raise NotImplementedError()
+
 
 class SkyCircle(SkyStencil):
     """A sky-coordinate circular stencil.
@@ -317,6 +328,16 @@ class SkyCircle(SkyStencil):
         metadata.set("ST_DEC", self._center.getDec().asDegrees(), "Circle center declination in degrees.")
         metadata.set("ST_RAD", self._radius.asDegrees(), "Circle radius in degrees.")
 
+    @property
+    def fingerprint(self) -> bytes:
+        # Docstring inherited.
+        hasher = blake2b(digest_size=16)
+        hasher.update(b"CIRCLE")
+        hasher.update(struct.pack("!d", self._center.getRa().asRadians()))
+        hasher.update(struct.pack("!d", self._center.getDec().asRadians()))
+        hasher.update(struct.pack("!d", self._radius.asRadians()))
+        return hasher.digest()
+
 
 class SkyPolygon(SkyStencil):
     """A sky-coordinate stencil in the shape of a great-circle polygon.
@@ -400,6 +421,15 @@ class SkyPolygon(SkyStencil):
         for n, v in enumerate(self._vertices):
             metadata.set(f"ST_RA{n:02d}", v.getRa().asDegrees(), f"Vertex {n} right ascension in degrees.")
             metadata.set(f"ST_DEC{n:02d}", v.getDec().asDegrees(), f"Vertex {n} declination in degrees.")
+
+    @property
+    def fingerprint(self) -> bytes:
+        # Docstring inherited.
+        hasher = blake2b(digest_size=16)
+        hasher.update(b"POLYGON")
+        for v in self._vertices:
+            hasher.update(struct.pack("!d!d", v.getRa().asRadians(), v.getDecx().asRadians()))
+        return hasher.digest()
 
 
 def _angle_from_astropy(angle: astropy.coordinates.Angle) -> Angle:
