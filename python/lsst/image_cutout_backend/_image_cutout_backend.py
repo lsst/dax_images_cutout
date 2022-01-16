@@ -30,6 +30,7 @@ from uuid import UUID
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage
 from lsst.daf.base import PropertyList
 from lsst.daf.butler import Butler, DataId, DatasetRef
+from lsst.resources import ResourcePath, ResourcePathExpression
 
 from .projection_finders import ProjectionFinder
 from .stencils import PixelStencil, SkyStencil
@@ -91,6 +92,26 @@ class ReadResult:
         bits = mask.getPlaneBitMask(name)
         self.pixel_stencil.set_mask(mask, bits)
 
+    def write_fits(self, path: str) -> None:
+        """Write the cutout to a FITS file.
+
+        Parameters
+        ----------
+        path : `str`
+            Local path to the file.
+
+        Notes
+        -----
+        If ``cutout`` is an `Exposure`, this will merge `metadata` into the
+        cutout's attached metadata.  In other cases, `metadata` is written
+        to the primary header without modifying `cutout`.
+        """
+        if isinstance(self.cutout, Exposure):
+            self.cutout.getMetadata().update(self.metadata)
+            self.cutout.writeFits(path)
+        else:
+            self.cutout.writeFits(path, metadata=self.metadata)
+
 
 class ImageCutoutBackend:
     """High-level interface to the image cutout backend.
@@ -102,11 +123,38 @@ class ImageCutoutBackend:
     projection_finder : `ProjectionObject`
         Object that obtains the WCS and bounding box for butler datasets of
         different types.  May include caches.
+    output_root : convertible to `ResourcePath`
+        Root of output file URIs.  This will be combined with the originating
+        dataset's UUID and an encoding of the stencil to form the complete URI.
+    filename_template : `str`, optional
+        Template for output file names, not including the ``output_root``
+        prefix or the file type extension.  This is a `str.format` template
+        with named substitutions.  These must include ``stencil`` (the sky
+        stencil fingerprint in hex), and a unique set of fields from ``ref``
+        (the origin `DatasetRef`), such as ``ref.id`` or a combination of the
+        dataset type, `~lsst.daf.butler.CollectionType.RUN`` collection, and
+        data ID, but ``ref.dataId`` may not be expanded.
+    temporary_root : convertible to `ResourcePath`, optional
+        Local filesystem root to write files to before they are transferred to
+        ``output_root`` (passed as the prefix argument to
+        `ResourcePath.temporary_uri`).
     """
 
-    def __init__(self, butler: Butler, projection_finder: ProjectionFinder):
+    def __init__(
+        self,
+        butler: Butler,
+        projection_finder: ProjectionFinder,
+        output_root: ResourcePathExpression,
+        filename_template: str = "{ref.id.hex}-{stencil}",
+        temporary_root: Optional[ResourcePathExpression] = None,
+    ):
         self.butler = butler
         self.projection_finder = projection_finder
+        self.output_root = ResourcePath(output_root, forceAbsolute=True, forceDirectory=True)
+        self.filename_template = filename_template
+        self.temporary_root = (
+            ResourcePath(temporary_root, forceDirectory=False) if temporary_root is not None else None
+        )
 
     butler: Butler
     """Butler client used to read cutouts (`Butler`).
@@ -116,6 +164,122 @@ class ImageCutoutBackend:
     """Object that obtains the WCS and bounding box for butler datasets of
     different types (`ProjectionFinder`).
     """
+
+    output_root: ResourcePath
+    """Root path that extracted cutouts are written to (`ResourcePath`).
+    """
+
+    filename_template: str
+    """Template for output file names, not including the ``output_root``
+    prefix or the file type extension.
+    """
+
+    temporary_root: Optional[ResourcePath]
+    """Local filesystem root to write files to before they are transferred to
+    ``output_root``
+    """
+
+    def process_ref(
+        self, stencil: SkyStencil, ref: DatasetRef, *, mask_plane: Optional[str] = "STENCIL"
+    ) -> ResourcePath:
+        """Extract and write a cutout from a fully-resolved `DatasetRef`.
+
+        Parameters
+        ----------
+        stencil : `SkyStencil`
+            Definition of the cutout region, in sky coordinates.
+        ref : `DatasetRef`
+            Fully-resolved reference to the dataset to obtain the cutout from.
+            Must have ``DatasetRef.id`` not `None` (use `read_search` instead
+            when this is not the case).  Need not have an expanded data ID.
+            May represent an image-like dataset component.
+        mask : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout showing
+            the approximate stencil region.  Does nothing if the image type
+            does not have a mask plane.  Defaults to ``STENCIL``.
+
+        Returns
+        -------
+        uri : `ResourcePath`
+            Full path to the extracted cutout.
+        """
+        read_result = self.read_ref(stencil, ref)
+        if mask_plane is not None:
+            read_result.mask(mask_plane)
+        return self.write_fits(read_result)
+
+    def process_uuid(
+        self,
+        stencil: SkyStencil,
+        uuid: UUID,
+        *,
+        component: Optional[str] = None,
+        mask_plane: Optional[str] = "STENCIL",
+    ) -> ResourcePath:
+        """Extract and write a cutout from a dataset identified by its UUID.
+
+        Parameters
+        ----------
+        stencil : `SkyStencil`
+            Definition of the cutout region, in sky coordinates.
+        uuid : `UUID`
+            Unique ID of the dataset to read from.
+        component : `str`, optional
+            If not `None` (default), read this component instead of the
+            composite dataset.
+        mask : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout showing
+            the approximate stencil region.  Does nothing if the image type
+            does not have a mask plane.  Defaults to ``STENCIL``.
+
+        Returns
+        -------
+        uri : `ResourcePath`
+            Full path to the extracted cutout.
+        """
+        read_result = self.read_uuid(stencil, uuid, component=component)
+        if mask_plane is not None:
+            read_result.mask(mask_plane)
+        return self.write_fits(read_result)
+
+    def process_search(
+        self,
+        stencil: SkyStencil,
+        dataset_type_name: str,
+        data_id: DataId,
+        collections: Iterable[str],
+        *,
+        mask_plane: Optional[str] = "STENCIL",
+    ) -> ResourcePath:
+        """Extract and write a cutout from a dataset identified by its UUID.
+
+        Parameters
+        ----------
+        stencil : `SkyStencil`
+            Definition of the cutout region, in sky coordinates.
+        dataset_type_name : `str`
+            Name of the butler dataset.  Use ``.``-separate terms to read an
+            image-like component.
+        data_id : `dict` or `DataCoordinate`
+            Mapping-of-dimensions identifier for the dataset within its
+            collection.
+        collections : `Iterable` [ `str` ]
+            Collections to search for the dataset, in the order they should be
+            searched.
+        mask : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout showing
+            the approximate stencil region.  Does nothing if the image type
+            does not have a mask plane.  Defaults to ``STENCIL``.
+
+        Returns
+        -------
+        uri : `ResourcePath`
+            Full path to the extracted cutout.
+        """
+        read_result = self.read_search(stencil, dataset_type_name, data_id, collections)
+        if mask_plane is not None:
+            read_result.mask(mask_plane)
+        return self.write_fits(read_result)
 
     def read_ref(self, stencil: SkyStencil, ref: DatasetRef) -> ReadResult:
         """Read a cutout from a fully-resolved `DatasetRef`.
@@ -148,7 +312,7 @@ class ImageCutoutBackend:
         cutout = self.butler.getDirect(ref, parameters={"bbox": pixel_stencil.bbox})
         # Create some FITS metadata with the cutout parameters.
         metadata = PropertyList()
-        metadata.set("BTLRUUID", ref.id, "Butler dataset UUID this cutout was extracted from.")
+        metadata.set("BTLRUUID", ref.id.hex, "Butler dataset UUID this cutout was extracted from.")
         metadata.set(
             "BTLRNAME", ref.datasetType.name, "Butler dataset type name this cutout was extracted from."
         )
@@ -157,7 +321,7 @@ class ImageCutoutBackend:
         for n, (k, v) in enumerate(ref.dataId.items()):
             # Write data ID dictionary sort of like a list of 2-tuples, to make
             # it easier to stay within the FITS 8-char key limit.
-            metadata.set(f"BTLRK{n:03}", k, f"Name of dimension {n} in the data ID.")
+            metadata.set(f"BTLRK{n:03}", k.name, f"Name of dimension {n} in the data ID.")
             metadata.set(f"BTLRV{n:03}", v, f"Value of dimension {n} in the data ID.")
         stencil.to_fits_metadata(metadata)
         return ReadResult(
@@ -222,3 +386,27 @@ class ImageCutoutBackend:
         """
         ref = self.butler.registry.findDataset(dataset_type_name, data_id, collections)
         return self.read_ref(stencil, ref)
+
+    def write_fits(self, read_result: ReadResult) -> ResourcePath:
+        """Write a `ReadResult` to a remote FITS file in `output_root`.
+
+        Parameters
+        ----------
+        read_result : `ReadResult`
+            Result of a call to a ``read_*`` method.
+
+        Returns
+        -------
+        uri : `ResourcePath`
+            Full path to the extracted cutout.
+        """
+        remote_uri = self.output_root.join(
+            self.filename_template.format(
+                ref=read_result.origin_ref, stencil=read_result.sky_stencil.fingerprint.hex()
+            )
+            + ".fits"
+        )
+        with ResourcePath.temporary_uri(prefix=self.temporary_root, suffix=".fits") as tmp_uri:
+            read_result.write_fits(tmp_uri.ospath)
+            remote_uri.transfer_from(tmp_uri, transfer="copy")
+        return remote_uri
