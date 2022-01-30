@@ -317,9 +317,7 @@ class SkyCircle(SkyStencil):
     @property
     def region(self) -> lsst.sphgeom.Region:
         # Docstring inherited.
-        return lsst.sphgeom.Circle(
-            self._center.getVector(), lsst.sphgeom.Angle.fromRadians(self._radius.asRadians())
-        )
+        return lsst.sphgeom.Circle(self._center.getVector(), self._radius)
 
     def to_fits_metadata(self, metadata: PropertyList) -> None:
         # Docstring inherited.

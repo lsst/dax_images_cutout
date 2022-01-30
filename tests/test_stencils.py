@@ -56,7 +56,6 @@ class SkyCircleTestCase(unittest.TestCase):
         )
         self.assertEqual(self.instance.region, other.region)
 
-    @unittest.skip("Requires a weekly build with DM-32097 changes to geom in CI.")
     def test_repr(self) -> None:
         """Test that eval(repr(...)) round-trips."""
         self.assertEqual(eval(repr(self.instance)).region, self.instance.region)
