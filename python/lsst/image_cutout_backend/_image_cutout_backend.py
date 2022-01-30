@@ -25,7 +25,7 @@ __all__ = ("ImageCutoutBackend", "ReadResult")
 
 import dataclasses
 from typing import Iterable, Optional, Union
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage
 from lsst.daf.base import PropertyList
@@ -126,14 +126,6 @@ class ImageCutoutBackend:
     output_root : convertible to `ResourcePath`
         Root of output file URIs.  This will be combined with the originating
         dataset's UUID and an encoding of the stencil to form the complete URI.
-    filename_template : `str`, optional
-        Template for output file names, not including the ``output_root``
-        prefix or the file type extension.  This is a `str.format` template
-        with named substitutions.  These must include ``stencil`` (the sky
-        stencil fingerprint in hex), and a unique set of fields from ``ref``
-        (the origin `DatasetRef`), such as ``ref.id`` or a combination of the
-        dataset type, `~lsst.daf.butler.CollectionType.RUN`` collection, and
-        data ID, but ``ref.dataId`` may not be expanded.
     temporary_root : convertible to `ResourcePath`, optional
         Local filesystem root to write files to before they are transferred to
         ``output_root`` (passed as the prefix argument to
@@ -145,13 +137,11 @@ class ImageCutoutBackend:
         butler: Butler,
         projection_finder: ProjectionFinder,
         output_root: ResourcePathExpression,
-        filename_template: str = "{ref.id.hex}-{stencil}",
         temporary_root: Optional[ResourcePathExpression] = None,
     ):
         self.butler = butler
         self.projection_finder = projection_finder
         self.output_root = ResourcePath(output_root, forceAbsolute=True, forceDirectory=True)
-        self.filename_template = filename_template
         self.temporary_root = (
             ResourcePath(temporary_root, forceDirectory=False) if temporary_root is not None else None
         )
@@ -167,11 +157,6 @@ class ImageCutoutBackend:
 
     output_root: ResourcePath
     """Root path that extracted cutouts are written to (`ResourcePath`).
-    """
-
-    filename_template: str
-    """Template for output file names, not including the ``output_root``
-    prefix or the file type extension.
     """
 
     temporary_root: Optional[ResourcePath]
@@ -400,12 +385,8 @@ class ImageCutoutBackend:
         uri : `ResourcePath`
             Full path to the extracted cutout.
         """
-        remote_uri = self.output_root.join(
-            self.filename_template.format(
-                ref=read_result.origin_ref, stencil=read_result.sky_stencil.fingerprint.hex()
-            )
-            + ".fits"
-        )
+        output_uuid = uuid4()
+        remote_uri = self.output_root.join(output_uuid.hex + ".fits")
         with ResourcePath.temporary_uri(prefix=self.temporary_root, suffix=".fits") as tmp_uri:
             read_result.write_fits(tmp_uri.ospath)
             remote_uri.transfer_from(tmp_uri, transfer="copy")
