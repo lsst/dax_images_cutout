@@ -27,7 +27,6 @@ __all__ = (
     "SkyCircle",
     "SkyPolygon",
     "SkyStencil",
-    "SpanSetStencil",
     "StencilNotContainedError",
 )
 
@@ -42,7 +41,7 @@ import lsst.afw.geom.ellipses
 import lsst.afw.geom.polygon
 import lsst.sphgeom
 import numpy as np
-from lsst.afw.geom import SkyWcs, SpanSet, makeCdMatrix, makeSkyWcs
+from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
 from lsst.daf.base import PropertyList
 from lsst.geom import Angle, Box2I, Point2D, SpherePoint, radians
@@ -80,29 +79,6 @@ class PixelStencil(ABC):
         at least at present.
         """
         raise NotImplementedError()
-
-
-class SpanSetStencil(PixelStencil):
-    """A pixel-coordinate stencil backed by `lsst.afw.geom.SpanSet`.
-
-    Parameters
-    ----------
-    spans : `SpanSet`
-        Data structure containing ``(y, x0, x1)`` spans that define
-        the stencil area.
-    """
-
-    def __init__(self, spans: SpanSet):
-        self.spans = spans
-
-    @property
-    def bbox(self) -> Box2I:
-        # Docstring inherited.
-        return self.spans.getBBox()
-
-    def set_mask(self, mask: Mask, bits: int) -> None:
-        # Docstring inherited.
-        self.spans.setMask(mask, bits)
 
 
 class PixelPolygon(PixelStencil):
