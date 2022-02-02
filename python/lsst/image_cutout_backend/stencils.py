@@ -42,7 +42,7 @@ import lsst.afw.geom.ellipses
 import lsst.afw.geom.polygon
 import lsst.sphgeom
 import numpy as np
-from lsst.afw.geom import SkyWcs, SpanSet, linearizeTransform, makeCdMatrix, makeSkyWcs, makeWcsPairTransform
+from lsst.afw.geom import SkyWcs, SpanSet, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
 from lsst.daf.base import PropertyList
 from lsst.geom import Angle, Box2I, Point2D, SpherePoint, radians
@@ -221,12 +221,9 @@ class SkyCircle(SkyStencil):
 
     Notes
     -----
-    The `to_pixels` implementation for this class transforms the circle
-    to an ellipse via a local linear approximation to the WCS.  This works well
-    for small circles on the scale of a few arcseconds, and should usually be
-    fine for circles on the scale of a few arcminutes, as long as the WCS is
-    not highly nonlinear.  For larger circles, it may be more accurate to
-    first call `to_polygon` and pixelize the result.
+    The `to_pixels` implementation for this class converts the sky region to a
+    polygon with approximately arcsecond vertices (but a minimum of 12
+    vertices), and then converts that to pixel coordinates.
     """
 
     def __init__(self, center: SpherePoint, radius: Angle, clip: bool = False):
@@ -296,23 +293,10 @@ class SkyCircle(SkyStencil):
 
     def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
         # Docstring inherited.
-        transform = makeWcsPairTransform(_make_local_gnomonic_wcs(self._center), wcs)
-        affine = linearizeTransform(transform, Point2D(0.0, 0.0))
-        sky_ellipse_core = lsst.afw.geom.ellipses.Axes(
-            self._radius.asRadians(), self._radius.asRadians(), 0.0
-        )
-        pixel_ellipse_core = sky_ellipse_core.transform(affine.getLinear())
-        spans = SpanSet.fromShape(
-            lsst.afw.geom.ellipses.Ellipse(pixel_ellipse_core, wcs.skyToPixel(self._center))
-        )
-        if not bbox.contains(spans.getBBox()):
-            if self._clip:
-                spans = spans.clippedTo(bbox)
-            else:
-                raise StencilNotContainedError(
-                    f"{self} has bbox {spans.getBBox()} in pixel coordinates, which is not within {bbox}."
-                )
-        return SpanSetStencil(spans)
+        # convert to a polygon with ~arcsecond vertices
+        circumference = 2 * np.pi * np.sin(self._radius.asRadians()) * radians
+        n_vertices = max(16, np.round(circumference.asArcseconds()))
+        return self.to_polygon(n_vertices).to_pixels(wcs, bbox)
 
     @property
     def region(self) -> lsst.sphgeom.Region:
