@@ -271,7 +271,7 @@ class SkyCircle(SkyStencil):
         # Docstring inherited.
         # convert to a polygon with ~arcsecond vertices
         circumference = 2 * np.pi * np.sin(self._radius.asRadians()) * radians
-        n_vertices = max(16, np.round(circumference.asArcseconds()))
+        n_vertices = max(16, int(np.round(circumference.asArcseconds())))
         return self.to_polygon(n_vertices).to_pixels(wcs, bbox)
 
     @property
