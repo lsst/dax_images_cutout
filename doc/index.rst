@@ -9,4 +9,4 @@ image_cutout_backend documentation preview
 .. toctree::
    :maxdepth: 1
 
-   lsst.image.cutout.backend/index
+   lsst.image_cutout_backend/index
