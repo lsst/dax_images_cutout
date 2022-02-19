@@ -3,6 +3,10 @@ setupRequired(daf_butler)
 setupRequired(sphgeom)
 setupRequired(geom)
 setupRequired(afw)
+setupRequired(skymap)
+
+# For tests of making cutouts from images in a butler repo.
+setupOptional(testdata_image_cutouts)
 
 # The following is boilerplate for all packages.
 # See https://dmtn-001.lsst.io for details on LSST_LIBRARY_PATH.

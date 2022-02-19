@@ -38,7 +38,7 @@ from .stencils import PixelStencil, SkyStencil
 
 @dataclasses.dataclass
 class Extraction:
-    """A struct that aggregates the results of extracting subimagines in the
+    """A struct that aggregates the results of extracting subimages in the
     image cutout backend.
     """
 
@@ -236,7 +236,8 @@ class ImageCutoutBackend:
         *,
         mask_plane: Optional[str] = "STENCIL",
     ) -> ResourcePath:
-        """Extract and write a cutout from a dataset identified by its UUID.
+        """Extract and write a cutout from a dataset identified by a
+        (dataset type, data ID, collection path) tuple.
 
         Parameters
         ----------
