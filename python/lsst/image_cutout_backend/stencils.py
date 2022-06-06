@@ -44,7 +44,7 @@ import numpy as np
 from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
 from lsst.daf.base import PropertyList
-from lsst.geom import Angle, Box2I, Point2D, SpherePoint, radians
+from lsst.geom import Angle, Box2D, Box2I, Point2D, SpherePoint, radians
 
 
 class StencilNotContainedError(RuntimeError):
@@ -109,6 +109,7 @@ class PixelPolygon(PixelStencil):
         self._bbox = Box2I(polygon.getBBox())
         if bbox is not None:
             self._bbox.clip(bbox)
+            self._polygon = self._polygon.intersectionSingle(Box2D(self._bbox))
 
     @property
     def bbox(self) -> Box2I:
@@ -202,6 +203,8 @@ class SkyCircle(SkyStencil):
     vertices), and then converts that to pixel coordinates.
     """
 
+    MAX_POLYGON_VERTICES = 64
+
     def __init__(self, center: SpherePoint, radius: Angle, clip: bool = False):
         self._center = center
         self._radius = radius
@@ -262,7 +265,7 @@ class SkyCircle(SkyStencil):
         Notes
         -----
         For large circles and/or highly nonlinear projections, this polygon
-        approximation be mapped much more accurately to pixel coordinates.
+        approximation can be mapped much more accurately to pixel coordinates.
         """
         factor = (2 * np.pi / n_vertices) * radians
         return SkyPolygon(self._center.offset(b * factor, self._radius) for b in range(n_vertices))
@@ -271,7 +274,7 @@ class SkyCircle(SkyStencil):
         # Docstring inherited.
         # convert to a polygon with ~arcsecond vertices
         circumference = 2 * np.pi * np.sin(self._radius.asRadians()) * radians
-        n_vertices = max(16, int(np.round(circumference.asArcseconds())))
+        n_vertices = min(max(16, int(np.round(circumference.asArcseconds()))), self.MAX_POLYGON_VERTICES)
         return self.to_polygon(n_vertices).to_pixels(wcs, bbox)
 
     @property

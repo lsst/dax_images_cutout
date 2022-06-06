@@ -24,7 +24,7 @@ from __future__ import annotations
 __all__ = ("ImageCutoutBackend", "Extraction")
 
 import dataclasses
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Union, cast
 from uuid import UUID, uuid4
 
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage
@@ -298,7 +298,9 @@ class ImageCutoutBackend:
         cutout = self.butler.getDirect(ref, parameters={"bbox": pixel_stencil.bbox})
         # Create some FITS metadata with the cutout parameters.
         metadata = PropertyList()
-        metadata.set("BTLRUUID", ref.id.hex, "Butler dataset UUID this cutout was extracted from.")
+        metadata.set(
+            "BTLRUUID", cast(UUID, ref.id).hex, "Butler dataset UUID this cutout was extracted from."
+        )
         metadata.set(
             "BTLRNAME", ref.datasetType.name, "Butler dataset type name this cutout was extracted from."
         )
@@ -339,6 +341,8 @@ class ImageCutoutBackend:
             `Extraction.mask` must be called explicitly if desired.
         """
         ref = self.butler.registry.getDataset(uuid)
+        if ref is None:
+            raise LookupError(f"No dataset found with UUID {uuid}.")
         if component is not None:
             ref = ref.makeComponentRef(component)
         return self.extract_ref(stencil, ref)
@@ -370,7 +374,11 @@ class ImageCutoutBackend:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
-        ref = self.butler.registry.findDataset(dataset_type_name, data_id, collections)
+        ref = self.butler.registry.findDataset(dataset_type_name, data_id, collections=collections)
+        if ref is None:
+            raise LookupError(
+                f"No {dataset_type_name} dataset found with data ID {data_id} in {collections}."
+            )
         return self.extract_ref(stencil, ref)
 
     def write_fits(self, extract_result: Extraction) -> ResourcePath:

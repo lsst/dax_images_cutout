@@ -32,7 +32,7 @@ __all__ = (
 
 import re
 from abc import ABC, abstractmethod
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple, cast
 
 from lsst.afw.geom import SkyWcs
 from lsst.daf.butler import Butler, DatasetRef
@@ -203,7 +203,7 @@ class UseSkyMap(ProjectionFinder):
         # Docstring inherited.
         if "tract" in ref.dataId.graph.names:
             assert "skymap" in ref.dataId.graph.names, "Guaranteed by expected dimension schema."
-            if (skymap := self._cache.get(ref.dataId["skymap"])) is None:
+            if (skymap := self._cache.get(cast(str, ref.dataId["skymap"]))) is None:
                 skymap = butler.get(
                     self._dataset_type_name, skymap=ref.dataId["skymap"], collections=self._collections
                 )
