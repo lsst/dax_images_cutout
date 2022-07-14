@@ -242,12 +242,13 @@ class SkyCircle(SkyStencil):
         return cls(
             center=_spherepoint_from_astropy(center),
             radius=_angle_from_astropy(radius),
+            clip=clip,
         )
 
     @classmethod
     def from_sphgeom(cls, circle: lsst.sphgeom.Circle, clip: bool = False) -> SkyCircle:
         """Construct from a `lsst.sphgeom.Circle` instance."""
-        return cls(SpherePoint(circle.getCenter()), Angle(circle.getOpeningAngle()))
+        return cls(SpherePoint(circle.getCenter()), Angle(circle.getOpeningAngle()), clip=clip)
 
     def to_polygon(self, n_vertices: int = 16) -> SkyPolygon:
         """Return a polygon sky stencil that approximates this circle.
@@ -268,7 +269,9 @@ class SkyCircle(SkyStencil):
         approximation can be mapped much more accurately to pixel coordinates.
         """
         factor = (2 * np.pi / n_vertices) * radians
-        return SkyPolygon(self._center.offset(b * factor, self._radius) for b in range(n_vertices))
+        return SkyPolygon(
+            (self._center.offset(b * factor, self._radius) for b in range(n_vertices)), clip=self._clip
+        )
 
     def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
         # Docstring inherited.
@@ -342,7 +345,7 @@ class SkyPolygon(SkyStencil):
         stencil : `SkyPolygon`
             Polygon stencil.
         """
-        return cls(_spherepoint_from_astropy(v) for v in vertices)
+        return cls((_spherepoint_from_astropy(v) for v in vertices), clip=clip)
 
     def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
         # Docstring inherited.
