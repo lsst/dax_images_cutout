@@ -24,7 +24,7 @@ from __future__ import annotations
 __all__ = ("ImageCutoutBackend", "Extraction")
 
 import dataclasses
-from typing import Iterable, Optional, Union, cast
+from typing import Iterable, Optional, Union
 from uuid import UUID, uuid4
 
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage
@@ -295,12 +295,10 @@ class ImageCutoutBackend:
         pixel_stencil = stencil.to_pixels(wcs, bbox)
         # Actually read the cutout.  Leave it to the butler to cache remote
         # files locally or do partial remote reads.
-        cutout = self.butler.getDirect(ref, parameters={"bbox": pixel_stencil.bbox})
+        cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
         # Create some FITS metadata with the cutout parameters.
         metadata = PropertyList()
-        metadata.set(
-            "BTLRUUID", cast(UUID, ref.id).hex, "Butler dataset UUID this cutout was extracted from."
-        )
+        metadata.set("BTLRUUID", ref.id.hex, "Butler dataset UUID this cutout was extracted from.")
         metadata.set(
             "BTLRNAME", ref.datasetType.name, "Butler dataset type name this cutout was extracted from."
         )

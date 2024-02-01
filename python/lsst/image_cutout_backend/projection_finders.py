@@ -135,8 +135,8 @@ class ReadComponents(ProjectionFinder):
     def find_projection(self, ref: DatasetRef, butler: Butler) -> Optional[Tuple[SkyWcs, Box2I]]:
         # Docstring inherited.
         if {"wcs", "bbox"}.issubset(ref.datasetType.storageClass.allComponents().keys()):
-            wcs = butler.getDirect(ref.makeComponentRef("wcs"))
-            bbox = butler.getDirect(ref.makeComponentRef("bbox"))
+            wcs = butler.get(ref.makeComponentRef("wcs"))
+            bbox = butler.get(ref.makeComponentRef("bbox"))
             return wcs, bbox
         return None
 
