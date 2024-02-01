@@ -395,6 +395,7 @@ class ImageCutoutBackend:
         output_uuid = uuid4()
         remote_uri = self.output_root.join(output_uuid.hex + ".fits")
         with ResourcePath.temporary_uri(prefix=self.temporary_root, suffix=".fits") as tmp_uri:
+            tmp_uri.parent().mkdir()
             extract_result.write_fits(tmp_uri.ospath)
             remote_uri.transfer_from(tmp_uri, transfer="copy")
         return remote_uri
