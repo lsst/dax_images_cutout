@@ -143,7 +143,7 @@ class ImageCutoutBackend:
         self.projection_finder = projection_finder
         self.output_root = ResourcePath(output_root, forceAbsolute=True, forceDirectory=True)
         self.temporary_root = (
-            ResourcePath(temporary_root, forceDirectory=False) if temporary_root is not None else None
+            ResourcePath(temporary_root, forceDirectory=True) if temporary_root is not None else None
         )
 
     butler: Butler
