@@ -24,7 +24,7 @@ from __future__ import annotations
 __all__ = ("ImageCutoutBackend", "Extraction")
 
 import dataclasses
-from typing import Iterable, Optional, Union
+from typing import Optional, Sequence, Union
 from uuid import UUID, uuid4
 
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage
@@ -232,7 +232,7 @@ class ImageCutoutBackend:
         stencil: SkyStencil,
         dataset_type_name: str,
         data_id: DataId,
-        collections: Iterable[str],
+        collections: Sequence[str],
         *,
         mask_plane: Optional[str] = "STENCIL",
     ) -> ResourcePath:
@@ -338,7 +338,7 @@ class ImageCutoutBackend:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
-        ref = self.butler.registry.getDataset(uuid)
+        ref = self.butler.get_dataset(uuid)
         if ref is None:
             raise LookupError(f"No dataset found with UUID {uuid}.")
         if component is not None:
@@ -346,7 +346,7 @@ class ImageCutoutBackend:
         return self.extract_ref(stencil, ref)
 
     def extract_search(
-        self, stencil: SkyStencil, dataset_type_name: str, data_id: DataId, collections: Iterable[str]
+        self, stencil: SkyStencil, dataset_type_name: str, data_id: DataId, collections: Sequence[str]
     ) -> Extraction:
         """Extract a subimage from a dataset identified by a (dataset type,
         data ID, collection path) tuple.
@@ -372,7 +372,7 @@ class ImageCutoutBackend:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
-        ref = self.butler.registry.findDataset(dataset_type_name, data_id, collections=collections)
+        ref = self.butler.find_dataset(dataset_type_name, data_id, collections=collections)
         if ref is None:
             raise LookupError(
                 f"No {dataset_type_name} dataset found with data ID {data_id} in {collections}."
