@@ -32,8 +32,8 @@ __all__ = (
 
 import struct
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from hashlib import blake2b
-from typing import Iterable, Optional
 
 import astropy.coordinates
 import lsst.afw.detection
@@ -104,7 +104,7 @@ class PixelPolygon(PixelStencil):
     a pixel.  This may change in the future.
     """
 
-    def __init__(self, polygon: lsst.afw.geom.polygon.Polygon, bbox: Optional[Box2I] = None):
+    def __init__(self, polygon: lsst.afw.geom.polygon.Polygon, bbox: Box2I | None = None):
         self._polygon = polygon
         self._bbox = Box2I(polygon.getBBox())
         if bbox is not None:

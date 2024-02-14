@@ -32,7 +32,8 @@ __all__ = (
 
 import re
 from abc import ABC, abstractmethod
-from typing import Dict, Iterable, Optional, Tuple, cast
+from collections.abc import Iterable
+from typing import cast
 
 from lsst.afw.geom import SkyWcs
 from lsst.daf.butler import Butler, DatasetRef
@@ -55,7 +56,7 @@ class ProjectionFinder(ABC):
     """
 
     @abstractmethod
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> Optional[Tuple[SkyWcs, Box2I]]:
+    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         """Run the finder on the given dataset with the given butler.
 
         Parameters
@@ -76,7 +77,7 @@ class ProjectionFinder(ABC):
         """
         raise NotImplementedError()
 
-    def __call__(self, ref: DatasetRef, butler: Butler) -> Tuple[SkyWcs, Box2I]:
+    def __call__(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I]:
         """A thin wrapper around `find_projection` that raises `LookupError`
         when no projection information was found.
 
@@ -132,7 +133,7 @@ class ReadComponents(ProjectionFinder):
     or yield the most accurate WCS.
     """
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> Optional[Tuple[SkyWcs, Box2I]]:
+    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         if {"wcs", "bbox"}.issubset(ref.datasetType.storageClass.allComponents().keys()):
             wcs = butler.get(ref.makeComponentRef("wcs"))
@@ -160,7 +161,7 @@ class TryComponentParents(ProjectionFinder):
     def __init__(self, nested: ProjectionFinder):
         self._nested = nested
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> Optional[Tuple[SkyWcs, Box2I]]:
+    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         while True:
             if (result := self._nested.find_projection(ref, butler)) is not None:
@@ -197,9 +198,9 @@ class UseSkyMap(ProjectionFinder):
     def __init__(self, dataset_type_name: str = "skyMap", collections: Iterable[str] = ("skymaps",)):
         self._dataset_type_name = dataset_type_name
         self._collections = tuple(collections)
-        self._cache: Dict[str, BaseSkyMap] = {}
+        self._cache: dict[str, BaseSkyMap] = {}
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> Optional[Tuple[SkyWcs, Box2I]]:
+    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         if "tract" in ref.dataId.graph.names:
             assert "skymap" in ref.dataId.graph.names, "Guaranteed by expected dimension schema."
@@ -229,7 +230,7 @@ class Chain(ProjectionFinder):
     def __init__(self, *nested: ProjectionFinder):
         self._nested = tuple(nested)
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> Optional[Tuple[SkyWcs, Box2I]]:
+    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         for f in self._nested:
             if (result := f.find_projection(ref, butler)) is not None:
@@ -256,14 +257,14 @@ class MatchDatasetTypeName(ProjectionFinder):
     def __init__(
         self,
         regex: str,
-        on_match: Optional[ProjectionFinder] = None,
-        otherwise: Optional[ProjectionFinder] = None,
+        on_match: ProjectionFinder | None = None,
+        otherwise: ProjectionFinder | None = None,
     ):
         self._regex = re.compile(regex)
         self._on_match = on_match
         self._otherwise = otherwise
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> Optional[Tuple[SkyWcs, Box2I]]:
+    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         if self._regex.match(ref.datasetType.name):
             if self._on_match is not None:

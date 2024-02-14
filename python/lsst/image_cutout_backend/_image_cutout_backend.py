@@ -24,7 +24,7 @@ from __future__ import annotations
 __all__ = ("ImageCutoutBackend", "Extraction")
 
 import dataclasses
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage
@@ -42,7 +42,7 @@ class Extraction:
     image cutout backend.
     """
 
-    cutout: Union[Image, Mask, MaskedImage, Exposure]
+    cutout: Image | Mask | MaskedImage | Exposure
     """The image cutout itself.
     """
 
@@ -137,7 +137,7 @@ class ImageCutoutBackend:
         butler: Butler,
         projection_finder: ProjectionFinder,
         output_root: ResourcePathExpression,
-        temporary_root: Optional[ResourcePathExpression] = None,
+        temporary_root: ResourcePathExpression | None = None,
     ):
         self.butler = butler
         self.projection_finder = projection_finder
@@ -159,13 +159,13 @@ class ImageCutoutBackend:
     """Root path that extracted cutouts are written to (`ResourcePath`).
     """
 
-    temporary_root: Optional[ResourcePath]
+    temporary_root: ResourcePath | None
     """Local filesystem root to write files to before they are transferred to
     ``output_root``
     """
 
     def process_ref(
-        self, stencil: SkyStencil, ref: DatasetRef, *, mask_plane: Optional[str] = "STENCIL"
+        self, stencil: SkyStencil, ref: DatasetRef, *, mask_plane: str | None = "STENCIL"
     ) -> ResourcePath:
         """Extract and write a cutout from a fully-resolved `DatasetRef`.
 
@@ -198,8 +198,8 @@ class ImageCutoutBackend:
         stencil: SkyStencil,
         uuid: UUID,
         *,
-        component: Optional[str] = None,
-        mask_plane: Optional[str] = "STENCIL",
+        component: str | None = None,
+        mask_plane: str | None = "STENCIL",
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by its UUID.
 
@@ -234,7 +234,7 @@ class ImageCutoutBackend:
         data_id: DataId,
         collections: Sequence[str],
         *,
-        mask_plane: Optional[str] = "STENCIL",
+        mask_plane: str | None = "STENCIL",
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by a
         (dataset type, data ID, collection path) tuple.
@@ -318,7 +318,7 @@ class ImageCutoutBackend:
             origin_ref=ref,
         )
 
-    def extract_uuid(self, stencil: SkyStencil, uuid: UUID, *, component: Optional[str] = None) -> Extraction:
+    def extract_uuid(self, stencil: SkyStencil, uuid: UUID, *, component: str | None = None) -> Extraction:
         """Extract a subimage from a dataset identified by its UUID.
 
         Parameters
