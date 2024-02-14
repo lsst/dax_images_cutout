@@ -24,7 +24,7 @@ from __future__ import annotations
 __all__ = ("ImageCutoutBackend", "Extraction")
 
 import dataclasses
-from typing import Iterable, Optional, Union, cast
+from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage
@@ -42,7 +42,7 @@ class Extraction:
     image cutout backend.
     """
 
-    cutout: Union[Image, Mask, MaskedImage, Exposure]
+    cutout: Image | Mask | MaskedImage | Exposure
     """The image cutout itself.
     """
 
@@ -137,13 +137,13 @@ class ImageCutoutBackend:
         butler: Butler,
         projection_finder: ProjectionFinder,
         output_root: ResourcePathExpression,
-        temporary_root: Optional[ResourcePathExpression] = None,
+        temporary_root: ResourcePathExpression | None = None,
     ):
         self.butler = butler
         self.projection_finder = projection_finder
         self.output_root = ResourcePath(output_root, forceAbsolute=True, forceDirectory=True)
         self.temporary_root = (
-            ResourcePath(temporary_root, forceDirectory=False) if temporary_root is not None else None
+            ResourcePath(temporary_root, forceDirectory=True) if temporary_root is not None else None
         )
 
     butler: Butler
@@ -159,13 +159,13 @@ class ImageCutoutBackend:
     """Root path that extracted cutouts are written to (`ResourcePath`).
     """
 
-    temporary_root: Optional[ResourcePath]
+    temporary_root: ResourcePath | None
     """Local filesystem root to write files to before they are transferred to
     ``output_root``
     """
 
     def process_ref(
-        self, stencil: SkyStencil, ref: DatasetRef, *, mask_plane: Optional[str] = "STENCIL"
+        self, stencil: SkyStencil, ref: DatasetRef, *, mask_plane: str | None = "STENCIL"
     ) -> ResourcePath:
         """Extract and write a cutout from a fully-resolved `DatasetRef`.
 
@@ -198,8 +198,8 @@ class ImageCutoutBackend:
         stencil: SkyStencil,
         uuid: UUID,
         *,
-        component: Optional[str] = None,
-        mask_plane: Optional[str] = "STENCIL",
+        component: str | None = None,
+        mask_plane: str | None = "STENCIL",
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by its UUID.
 
@@ -232,9 +232,9 @@ class ImageCutoutBackend:
         stencil: SkyStencil,
         dataset_type_name: str,
         data_id: DataId,
-        collections: Iterable[str],
+        collections: Sequence[str],
         *,
-        mask_plane: Optional[str] = "STENCIL",
+        mask_plane: str | None = "STENCIL",
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by a
         (dataset type, data ID, collection path) tuple.
@@ -295,12 +295,10 @@ class ImageCutoutBackend:
         pixel_stencil = stencil.to_pixels(wcs, bbox)
         # Actually read the cutout.  Leave it to the butler to cache remote
         # files locally or do partial remote reads.
-        cutout = self.butler.getDirect(ref, parameters={"bbox": pixel_stencil.bbox})
+        cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
         # Create some FITS metadata with the cutout parameters.
         metadata = PropertyList()
-        metadata.set(
-            "BTLRUUID", cast(UUID, ref.id).hex, "Butler dataset UUID this cutout was extracted from."
-        )
+        metadata.set("BTLRUUID", ref.id.hex, "Butler dataset UUID this cutout was extracted from.")
         metadata.set(
             "BTLRNAME", ref.datasetType.name, "Butler dataset type name this cutout was extracted from."
         )
@@ -320,7 +318,7 @@ class ImageCutoutBackend:
             origin_ref=ref,
         )
 
-    def extract_uuid(self, stencil: SkyStencil, uuid: UUID, *, component: Optional[str] = None) -> Extraction:
+    def extract_uuid(self, stencil: SkyStencil, uuid: UUID, *, component: str | None = None) -> Extraction:
         """Extract a subimage from a dataset identified by its UUID.
 
         Parameters
@@ -340,7 +338,7 @@ class ImageCutoutBackend:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
-        ref = self.butler.registry.getDataset(uuid)
+        ref = self.butler.get_dataset(uuid)
         if ref is None:
             raise LookupError(f"No dataset found with UUID {uuid}.")
         if component is not None:
@@ -348,7 +346,7 @@ class ImageCutoutBackend:
         return self.extract_ref(stencil, ref)
 
     def extract_search(
-        self, stencil: SkyStencil, dataset_type_name: str, data_id: DataId, collections: Iterable[str]
+        self, stencil: SkyStencil, dataset_type_name: str, data_id: DataId, collections: Sequence[str]
     ) -> Extraction:
         """Extract a subimage from a dataset identified by a (dataset type,
         data ID, collection path) tuple.
@@ -374,7 +372,7 @@ class ImageCutoutBackend:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
-        ref = self.butler.registry.findDataset(dataset_type_name, data_id, collections=collections)
+        ref = self.butler.find_dataset(dataset_type_name, data_id, collections=collections)
         if ref is None:
             raise LookupError(
                 f"No {dataset_type_name} dataset found with data ID {data_id} in {collections}."
@@ -397,6 +395,7 @@ class ImageCutoutBackend:
         output_uuid = uuid4()
         remote_uri = self.output_root.join(output_uuid.hex + ".fits")
         with ResourcePath.temporary_uri(prefix=self.temporary_root, suffix=".fits") as tmp_uri:
+            tmp_uri.parent().mkdir()
             extract_result.write_fits(tmp_uri.ospath)
             remote_uri.transfer_from(tmp_uri, transfer="copy")
         return remote_uri
