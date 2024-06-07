@@ -304,10 +304,10 @@ class ImageCutoutBackend:
         )
         # TODO: write cutout timestamp to metadata.  Need to read up on how to
         # represent times in FITS headers.
-        for n, (k, v) in enumerate(ref.dataId.items()):
+        for n, (k, v) in enumerate(ref.dataId.required.items()):
             # Write data ID dictionary sort of like a list of 2-tuples, to make
             # it easier to stay within the FITS 8-char key limit.
-            metadata.set(f"BTLRK{n:03}", k.name, f"Name of dimension {n} in the data ID.")
+            metadata.set(f"BTLRK{n:03}", k, f"Name of dimension {n} in the data ID.")
             metadata.set(f"BTLRV{n:03}", v, f"Value of dimension {n} in the data ID.")
         stencil.to_fits_metadata(metadata)
         return Extraction(
