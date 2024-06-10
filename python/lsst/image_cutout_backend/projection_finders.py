@@ -202,14 +202,14 @@ class UseSkyMap(ProjectionFinder):
 
     def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
-        if "tract" in ref.dataId.graph.names:
-            assert "skymap" in ref.dataId.graph.names, "Guaranteed by expected dimension schema."
+        if "tract" in ref.dataId.dimensions:
+            assert "skymap" in ref.dataId.dimensions, "Guaranteed by expected dimension schema."
             if (skymap := self._cache.get(cast(str, ref.dataId["skymap"]))) is None:
                 skymap = butler.get(
                     self._dataset_type_name, skymap=ref.dataId["skymap"], collections=self._collections
                 )
             tractInfo = skymap[ref.dataId["tract"]]
-            if "patch" in ref.dataId.graph.names:
+            if "patch" in ref.dataId.dimensions:
                 patchInfo = tractInfo[ref.dataId["patch"]]
                 return patchInfo.wcs, patchInfo.outer_bbox
             else:
