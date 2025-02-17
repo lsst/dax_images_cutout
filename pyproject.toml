@@ -1,3 +1,6 @@
+[project]
+name = "lsst-dax-images-cutout"
+
 [tool.isort]
 profile = "black"
 line_length = 110

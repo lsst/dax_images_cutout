@@ -3,8 +3,7 @@ from lsst.sconsUtils import scripts
 
 # Python-only package
 scripts.BasicSConstruct(
-    "image_cutout_backend",
+    "dax_images_cutout",
     disableCc=True,
     noCfgFile=True,
-    versionModuleName="python/lsst/image_cutout_backend/version.py",
 )

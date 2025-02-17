@@ -1,4 +1,4 @@
-# This file is part of image_cutout_backend.
+# This file is part of dax_images_cutout.
 #
 # Developed for the LSST Data Management System.
 # This product includes software developed by the LSST Project
@@ -27,7 +27,7 @@ import lsst.daf.butler
 import lsst.geom
 import lsst.resources
 import lsst.utils.tests
-from lsst.image_cutout_backend import ImageCutoutBackend, projection_finders, stencils
+from lsst.dax.images.cutout import ImageCutoutBackend, projection_finders, stencils
 
 
 class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
