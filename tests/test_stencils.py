@@ -25,12 +25,13 @@ import unittest
 
 import astropy.coordinates
 import astropy.units
-import lsst.sphgeom
 import numpy as np
+
+import lsst.sphgeom
 from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
-from lsst.geom import Angle, Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
 from lsst.dax.images.cutout.stencils import SkyCircle, SkyStencil
+from lsst.geom import Angle, Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
 
 
 class SkyCircleTestCase(unittest.TestCase):

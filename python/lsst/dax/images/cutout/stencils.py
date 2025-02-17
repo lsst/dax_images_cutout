@@ -36,11 +36,12 @@ from collections.abc import Iterable
 from hashlib import blake2b
 
 import astropy.coordinates
+import numpy as np
+
 import lsst.afw.detection
 import lsst.afw.geom.ellipses
 import lsst.afw.geom.polygon
 import lsst.sphgeom
-import numpy as np
 from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
 from lsst.daf.base import PropertyList
