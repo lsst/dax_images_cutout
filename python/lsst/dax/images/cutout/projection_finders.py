@@ -78,8 +78,8 @@ class ProjectionFinder(ABC):
         raise NotImplementedError()
 
     def __call__(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I]:
-        """A thin wrapper around `find_projection` that raises `LookupError`
-        when no projection information was found.
+        """Call `find_projection` but raise `LookupError` when no projection
+        information is found.
 
         Parameters
         ----------

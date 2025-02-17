@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-__all__ = ("ImageCutoutBackend", "Extraction")
+__all__ = ("Extraction", "ImageCutoutBackend")
 
 import dataclasses
 from collections.abc import Sequence

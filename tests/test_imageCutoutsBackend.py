@@ -31,12 +31,14 @@ from lsst.dax.images.cutout import ImageCutoutBackend, projection_finders, stenc
 
 
 class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
+    """Tests for ImageCutoutsBackend."""
+
     @classmethod
     def setUpClass(cls):
         try:
             cls.data_dir = lsst.utils.getPackageDir("testdata_image_cutouts")
         except LookupError:
-            raise unittest.SkipTest("testdata_image_cutouts not setup.")
+            raise unittest.SkipTest("testdata_image_cutouts not setup.") from None
 
     def setUp(self):
         collection = "2.2i/runs/test-med-1/w_2022_03/DM-33223/20220118T193330Z"
@@ -49,7 +51,7 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
 
         self.projectionFinder = projection_finders.ReadComponents()
 
-        self.dataId = dict(patch=24, tract=3828, band="r", skymap="DC2")
+        self.dataId = {"patch": 24, "tract": 3828, "band": "r", "skymap": "DC2"}
 
     def test_extract_ref(self):
         """Test that extract_ref produces a reasonable cutout."""
