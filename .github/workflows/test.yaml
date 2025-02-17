@@ -45,3 +45,17 @@ jobs:
         run: |
           setup -v -r .
           mypy python/ tests/
+
+      - name: Upload coverage to codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: tests/.tests/pytest-dax_images_cutout.xml-cov-dax_images_cutout.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          files: tests/.tests/pytest-dax_images_cutout.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
