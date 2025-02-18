@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-__all__ = ("Extraction", "ImageCutoutBackend")
+__all__ = ("Extraction", "ImageCutoutFactory")
 
 import dataclasses
 from collections.abc import Sequence
@@ -113,8 +113,8 @@ class Extraction:
             self.cutout.writeFits(path, metadata=self.metadata)
 
 
-class ImageCutoutBackend:
-    """High-level interface to the image cutout backend.
+class ImageCutoutFactory:
+    """High-level interface to the image cutout functionality.
 
     Parameters
     ----------

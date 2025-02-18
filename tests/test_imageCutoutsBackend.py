@@ -27,7 +27,7 @@ import lsst.daf.butler
 import lsst.geom
 import lsst.resources
 import lsst.utils.tests
-from lsst.dax.images.cutout import ImageCutoutBackend, projection_finders, stencils
+from lsst.dax.images.cutout import ImageCutoutFactory, projection_finders, stencils
 
 
 class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
@@ -58,7 +58,7 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
         dataRef = self.butler.registry.findDataset("deepCoadd_calexp", dataId=self.dataId)
 
         with tempfile.TemporaryDirectory() as tempdir:
-            cutoutBackend = ImageCutoutBackend(self.butler, self.projectionFinder, tempdir)
+            cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinder, tempdir)
             result = cutoutBackend.extract_ref(self.stencil, dataRef)
             box = result.cutout.getBBox()
             self.assertEqual(box.width, 101)
