@@ -1,4 +1,4 @@
-# This file is part of image_cutout_backend.
+# This file is part of dax_images_cutout.
 #
 # Developed for the LSST Data Management System.
 # This product includes software developed by the LSST Project
@@ -25,12 +25,13 @@ import unittest
 
 import astropy.coordinates
 import astropy.units
-import lsst.sphgeom
 import numpy as np
+
+import lsst.sphgeom
 from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
+from lsst.dax.images.cutout.stencils import SkyCircle, SkyStencil
 from lsst.geom import Angle, Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
-from lsst.image_cutout_backend.stencils import SkyCircle, SkyStencil
 
 
 class SkyCircleTestCase(unittest.TestCase):

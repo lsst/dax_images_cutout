@@ -1,4 +1,4 @@
-# This file is part of image_cutout_backend.
+# This file is part of dax_images_cutout.
 #
 # Developed for the LSST Data Management System.
 # This product includes software developed by the LSST Project
@@ -27,16 +27,18 @@ import lsst.daf.butler
 import lsst.geom
 import lsst.resources
 import lsst.utils.tests
-from lsst.image_cutout_backend import ImageCutoutBackend, projection_finders, stencils
+from lsst.dax.images.cutout import ImageCutoutFactory, projection_finders, stencils
 
 
 class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
+    """Tests for ImageCutoutsBackend."""
+
     @classmethod
     def setUpClass(cls):
         try:
             cls.data_dir = lsst.utils.getPackageDir("testdata_image_cutouts")
         except LookupError:
-            raise unittest.SkipTest("testdata_image_cutouts not setup.")
+            raise unittest.SkipTest("testdata_image_cutouts not setup.") from None
 
     def setUp(self):
         collection = "2.2i/runs/test-med-1/w_2022_03/DM-33223/20220118T193330Z"
@@ -49,14 +51,14 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
 
         self.projectionFinder = projection_finders.ReadComponents()
 
-        self.dataId = dict(patch=24, tract=3828, band="r", skymap="DC2")
+        self.dataId = {"patch": 24, "tract": 3828, "band": "r", "skymap": "DC2"}
 
     def test_extract_ref(self):
         """Test that extract_ref produces a reasonable cutout."""
         dataRef = self.butler.registry.findDataset("deepCoadd_calexp", dataId=self.dataId)
 
         with tempfile.TemporaryDirectory() as tempdir:
-            cutoutBackend = ImageCutoutBackend(self.butler, self.projectionFinder, tempdir)
+            cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinder, tempdir)
             result = cutoutBackend.extract_ref(self.stencil, dataRef)
             box = result.cutout.getBBox()
             self.assertEqual(box.width, 101)

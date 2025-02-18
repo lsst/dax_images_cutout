@@ -1,6 +1,6 @@
-##########################################
-image_cutout_backend documentation preview
-##########################################
+#######################################
+dax_images_cutout documentation preview
+#######################################
 
 .. This page is for local development only. It isn't published to pipelines.lsst.io.
 
@@ -9,4 +9,4 @@ image_cutout_backend documentation preview
 .. toctree::
    :maxdepth: 1
 
-   lsst.image_cutout_backend/index
+   lsst.dax.images.cutout/index

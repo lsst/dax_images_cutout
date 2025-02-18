@@ -1,4 +1,4 @@
-# This file is part of image_cutout_backend.
+# This file is part of dax_images_cutout.
 #
 # Developed for the LSST Data Management System.
 # This product includes software developed by the LSST Project
@@ -36,11 +36,12 @@ from collections.abc import Iterable
 from hashlib import blake2b
 
 import astropy.coordinates
+import numpy as np
+
 import lsst.afw.detection
 import lsst.afw.geom.ellipses
 import lsst.afw.geom.polygon
 import lsst.sphgeom
-import numpy as np
 from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
 from lsst.daf.base import PropertyList

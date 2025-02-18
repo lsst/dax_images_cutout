@@ -1,4 +1,4 @@
-# This file is part of image_cutout_backend.
+# This file is part of dax_images_cutout.
 #
 # Developed for the LSST Data Management System.
 # This product includes software developed by the LSST Project
@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-__all__ = ("ImageCutoutBackend", "Extraction")
+__all__ = ("Extraction", "ImageCutoutFactory")
 
 import dataclasses
 from collections.abc import Sequence
@@ -113,8 +113,8 @@ class Extraction:
             self.cutout.writeFits(path, metadata=self.metadata)
 
 
-class ImageCutoutBackend:
-    """High-level interface to the image cutout backend.
+class ImageCutoutFactory:
+    """High-level interface to the image cutout functionality.
 
     Parameters
     ----------
