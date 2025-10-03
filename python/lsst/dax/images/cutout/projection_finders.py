@@ -36,7 +36,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import cast
 
-from lsst.afw.geom import SkyWcs
+import astropy.io.fits
+
+import lsst.geom
+from lsst.afw.geom import SkyWcs, getImageXY0FromMetadata, makeSkyWcs
+from lsst.daf.base import PropertyList
 from lsst.daf.butler import Butler, DatasetRef
 from lsst.geom import Box2I
 from lsst.skymap import BaseSkyMap
@@ -145,6 +149,52 @@ class ReadComponents(ProjectionFinder):
                 wcs = butler.get(ref.makeComponentRef("wcs"))
                 bbox = butler.get(ref.makeComponentRef("bbox"))
                 return wcs, bbox
+        return None
+
+
+class ReadComponentsAstropyFits(ProjectionFinder):
+    """A `ProjectionFinder` implementation that reads ``wcs`` and ``bbox``
+    from datasets that have them (e.g. ``Exposure``) and assumes there is
+    a WCS associated with an IMAGE HDU in a FITS file.
+
+    Notes
+    -----
+    This might be more efficient for remote datasets where a full file download
+    is needed for butler to work using AFW.
+    """
+
+    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+        # Docstring inherited.
+        with time_this(_LOG, msg="Read projection info using Astropy", level=_TIMER_LOG_LEVEL):
+            if {"wcs", "bbox"}.issubset(ref.datasetType.storageClass.allComponents().keys()):
+                try:
+                    fs, fspath = butler.getURI(ref).to_fsspec()
+                    with (
+                        fs.open(fspath) as f,
+                        astropy.io.fits.open(f) as fits_obj,
+                    ):
+                        # Look for first pixel HDU.
+                        pixel_components = {"mask", "image", "variance"}
+                        for i, hdu in enumerate(fits_obj):
+                            if i == 0:
+                                # Assumes WCS is in the IMAGE extension
+                                # and not stored in the primary.
+                                continue
+                            hdr = hdu.header
+                            extname = hdr.get("EXTNAME")
+                            if extname and extname.lower() in pixel_components:
+                                shape = hdu.shape
+                                dimensions = lsst.geom.Extent2I(shape[1], shape[0])
+                                pl = PropertyList()
+                                pl.update(hdr)
+                                # XY0 is defined in the A WCS.
+                                xy0 = getImageXY0FromMetadata(pl, "A", strip=False)
+                                bbox = lsst.geom.Box2I(xy0, dimensions)
+                                wcs = makeSkyWcs(pl)
+                                return wcs, bbox
+                except Exception:
+                    # Any failure and we will try the next option.
+                    pass
         return None
 
 
