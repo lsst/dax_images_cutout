@@ -23,11 +23,14 @@ import os.path
 import tempfile
 import unittest
 
+import astropy.io.fits
+
+import lsst.afw.image
 import lsst.daf.butler
 import lsst.geom
 import lsst.resources
 import lsst.utils.tests
-from lsst.dax.images.cutout import ImageCutoutFactory, projection_finders, stencils
+from lsst.dax.images.cutout import CutoutMode, ImageCutoutFactory, projection_finders, stencils
 
 
 class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
@@ -49,7 +52,10 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
         radius = 10 * lsst.geom.arcseconds
         self.stencil = stencils.SkyCircle(point, radius)
 
-        self.projectionFinder = projection_finders.ReadComponents()
+        self.projectionFinders = (
+            projection_finders.ReadComponents(),
+            projection_finders.ReadComponentsAstropyFits(),
+        )
 
         self.dataId = {"patch": 24, "tract": 3828, "band": "r", "skymap": "DC2"}
 
@@ -58,13 +64,37 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
         dataRef = self.butler.registry.findDataset("deepCoadd_calexp", dataId=self.dataId)
 
         with tempfile.TemporaryDirectory() as tempdir:
-            cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinder, tempdir)
-            result = cutoutBackend.extract_ref(self.stencil, dataRef)
-            box = result.cutout.getBBox()
-            self.assertEqual(box.width, 101)
-            self.assertEqual(box.height, 101)
-            # The galaxy should be near the center of the image.
-            self.assertFloatsAlmostEqual(result.cutout.image.array[50, 49], 2.083247661590576)
+            for cutout_mode in CutoutMode:
+                # Try each available projection finder at least once.
+                proj_finder = self.projectionFinders[cutout_mode.value % len(self.projectionFinders)]
+                cutoutBackend = ImageCutoutFactory(self.butler, proj_finder, tempdir)
+                result = cutoutBackend.extract_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
+                # The galaxy should be near the center of the image.
+                match result.cutout:
+                    case lsst.afw.image.Exposure() | lsst.afw.image.MaskedImage():
+                        box = result.cutout.getBBox()
+                        array = result.cutout.image.array
+                    case lsst.afw.image.Image():
+                        array = result.cutout.array
+                        box = result.cutout.getBBox()
+                    case astropy.io.fits.HDUList():
+                        hdu = result.cutout[1]
+                        array = hdu.data
+                        # Only checks the shape.
+                        box = lsst.geom.Box2I(lsst.geom.Point2I([1, 1]), lsst.geom.Extent2I(hdu.shape))
+                    case _:
+                        raise RuntimeError(f"Unexpected cutout type: {type(result.cutout)}")
+                self.assertEqual(box.width, 101)
+                self.assertEqual(box.height, 101)
+                self.assertFloatsAlmostEqual(array[50, 49], 2.083247661590576)
+                self.assertFloatsAlmostEqual(array[1, 1], -0.14575983583927155)
+                self.assertFloatsAlmostEqual(array[100, 100], 0.08674515783786774)
+
+                output = cutoutBackend.process_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
+                self.assertTrue(output.exists())
+
+                output = cutoutBackend.process_uuid(self.stencil, dataRef.id, cutout_mode=cutout_mode)
+                self.assertTrue(output.exists())
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ __all__ = (
     "MatchDatasetTypeName",
     "ProjectionFinder",
     "ReadComponents",
+    "ReadComponentsAstropyFits",
     "TryComponentParents",
     "UseSkyMap",
 )
