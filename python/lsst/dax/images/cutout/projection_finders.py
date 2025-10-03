@@ -30,6 +30,7 @@ __all__ = (
     "UseSkyMap",
 )
 
+import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -39,6 +40,10 @@ from lsst.afw.geom import SkyWcs
 from lsst.daf.butler import Butler, DatasetRef
 from lsst.geom import Box2I
 from lsst.skymap import BaseSkyMap
+from lsst.utils.timer import time_this
+
+_LOG = logging.getLogger(__name__)
+_TIMER_LOG_LEVEL = logging.INFO
 
 
 class ProjectionFinder(ABC):
@@ -136,9 +141,10 @@ class ReadComponents(ProjectionFinder):
     def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         if {"wcs", "bbox"}.issubset(ref.datasetType.storageClass.allComponents().keys()):
-            wcs = butler.get(ref.makeComponentRef("wcs"))
-            bbox = butler.get(ref.makeComponentRef("bbox"))
-            return wcs, bbox
+            with time_this(_LOG, msg="Read projection info from butler components", level=_TIMER_LOG_LEVEL):
+                wcs = butler.get(ref.makeComponentRef("wcs"))
+                bbox = butler.get(ref.makeComponentRef("bbox"))
+                return wcs, bbox
         return None
 
 
