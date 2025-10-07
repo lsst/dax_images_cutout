@@ -30,6 +30,7 @@ from enum import Enum, auto
 from uuid import UUID, uuid4
 
 import astropy.io.fits
+import astropy.time
 
 import lsst.geom
 from lsst.afw.geom.wcsUtils import getImageXY0FromMetadata
@@ -41,6 +42,7 @@ from lsst.utils.timer import time_this
 
 from .projection_finders import ProjectionFinder
 from .stencils import PixelStencil, SkyStencil
+from .version import __version__
 
 # Default logger.
 _LOG = logging.getLogger(__name__)
@@ -337,6 +339,9 @@ class ImageCutoutFactory:
         """
         if ref.id is None:
             raise ValueError(f"A resolved DatasetRef is required; got {ref}.")
+        # Timestamp of the cutout extraction.
+        now = astropy.time.Time.now()
+        timesys = "UTC"
         # Get the WCS and bbox of this dataset.
         wcs, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
         # Transform the stencil to pixel coordinates.
@@ -354,14 +359,18 @@ class ImageCutoutFactory:
             match cutout_mode:
                 case CutoutMode.FULL_EXPOSURE:
                     cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
+                    timesys = cutout.metadata.get("TIMESYS", timesys)
                 case CutoutMode.STRIPPED_EXPOSURE:
                     cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
                     metadata = cutout.metadata  # Track metadata externally.
+                    timesys = metadata.get("TIMESYS", timesys)
                     cutout = makeExposure(cutout.maskedImage, wcs=cutout.wcs)
                 case CutoutMode.IMAGE_ONLY:
                     cutout = self.butler.get(
                         ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox}
                     )
+                    # No metadata so UTC is default.
+                    timesys = "UTC"
                 case CutoutMode.MASKED_IMAGE:
                     # Rely on the file being cached on first read. Faster than
                     # reading entire exposure.
@@ -379,6 +388,7 @@ class ImageCutoutFactory:
                     cutout = makeExposure(masked_image, wcs=wcs)
 
                     metadata = self.butler.get(ref.makeComponentRef("metadata"))
+                    timesys = metadata.get("TIMESYS", timesys)
                 case CutoutMode.ASTROPY_IMAGE | CutoutMode.ASTROPY_MASKED_IMAGE:
                     # Bypass butler and try to find the pixel HDU directly.
                     # Approximate WCS is attached to DP1 image data but needs
@@ -397,6 +407,7 @@ class ImageCutoutFactory:
                         for hdu in fits_obj:
                             if not found_primary:
                                 hdul.append(hdu.copy())
+                                timesys = hdul[0].header.get("TIMESYS", timesys)
                                 found_primary = True
                                 continue
 
@@ -453,16 +464,19 @@ class ImageCutoutFactory:
         metadata.set(
             "BTLRNAME", ref.datasetType.name, "Butler dataset type name this cutout was extracted from."
         )
-        # TODO: write cutout timestamp to metadata.  Need to read up on how to
-        # represent times in FITS headers.
-        # In theory we need to look for a TIMESYS header indicating TAI vs UTC.
-
         for n, (k, v) in enumerate(ref.dataId.required.items()):
             # Write data ID dictionary sort of like a list of 2-tuples, to make
             # it easier to stay within the FITS 8-char key limit.
             metadata.set(f"BTLRK{n:03}", k, f"Name of dimension {n} in the data ID.")
             metadata.set(f"BTLRV{n:03}", v, f"Value of dimension {n} in the data ID.")
         stencil.to_fits_metadata(metadata)
+
+        # Record the time and software version.
+        now.format = "fits"
+        now = now.tai if timesys.lower() == "tai" else now.utc
+        metadata.set("DATE-CUT", str(now), "Time of cutout extraction")
+        metadata.set("CUTVERS", __version__, "dax_images_cutout software version")
+
         return Extraction(
             cutout=cutout,
             sky_stencil=stencil,
