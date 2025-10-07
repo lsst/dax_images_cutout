@@ -42,6 +42,7 @@ from lsst.utils.timer import time_this
 from .projection_finders import ProjectionFinder
 from .stencils import PixelStencil, SkyStencil
 
+# Default logger.
 _LOG = logging.getLogger(__name__)
 _TIMER_LOG_LEVEL = logging.INFO
 
@@ -117,13 +118,16 @@ class Extraction:
         bits = mask.getPlaneBitMask(name)
         self.pixel_stencil.set_mask(mask, bits)
 
-    def write_fits(self, path: str) -> None:
+    def write_fits(self, path: str, logger: logging.Logger | None = None) -> None:
         """Write the cutout to a FITS file.
 
         Parameters
         ----------
         path : `str`
             Local path to the file.
+        logger : `logging.Logger`, optional
+            Logger to use for timing messages.  If `None`, a default logger
+            will be used.
 
         Notes
         -----
@@ -131,7 +135,8 @@ class Extraction:
         cutout's attached metadata.  In other cases, `metadata` is written
         to the primary header without modifying `cutout`.
         """
-        with time_this(_LOG, msg="Writing FITS file to %s", args=(path,), level=_TIMER_LOG_LEVEL):
+        logger = logger if logger is not None else _LOG
+        with time_this(logger, msg="Writing FITS file to %s", args=(path,), level=_TIMER_LOG_LEVEL):
             if isinstance(self.cutout, Exposure):
                 self.cutout.getMetadata().update(self.metadata)
                 self.cutout.writeFits(path)
@@ -160,6 +165,9 @@ class ImageCutoutFactory:
         Local filesystem root to write files to before they are transferred to
         ``output_root`` (passed as the prefix argument to
         `ResourcePath.temporary_uri`).
+    logger : `logging.Logger`, optional
+        Logger to use for timing messages.  If `None`, a default logger
+        will be used.
     """
 
     def __init__(
@@ -168,6 +176,7 @@ class ImageCutoutFactory:
         projection_finder: ProjectionFinder,
         output_root: ResourcePathExpression,
         temporary_root: ResourcePathExpression | None = None,
+        logger: logging.Logger | None = None,
     ):
         self.butler = butler
         self.projection_finder = projection_finder
@@ -175,6 +184,7 @@ class ImageCutoutFactory:
         self.temporary_root = (
             ResourcePath(temporary_root, forceDirectory=True) if temporary_root is not None else None
         )
+        self.logger = logger if logger is not None else _LOG
 
     butler: Butler
     """Butler that subimage are extracted from (`Butler`).
@@ -328,7 +338,7 @@ class ImageCutoutFactory:
         if ref.id is None:
             raise ValueError(f"A resolved DatasetRef is required; got {ref}.")
         # Get the WCS and bbox of this dataset.
-        wcs, bbox = self.projection_finder(ref, self.butler)
+        wcs, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
         # Transform the stencil to pixel coordinates.
         pixel_stencil = stencil.to_pixels(wcs, bbox)
         # Somewhere to store metadata.
@@ -336,7 +346,10 @@ class ImageCutoutFactory:
         # Actually read the cutout.  Leave it to the butler to cache remote
         # files locally or do partial remote reads.
         with time_this(
-            _LOG, msg="Butler get %s (mode=%s)", args=(str(ref.id), str(cutout_mode)), level=_TIMER_LOG_LEVEL
+            self.logger,
+            msg="Extract cutout",
+            kwargs={"id": str(ref.id), "cutout_mode": str(cutout_mode), "stencil": str(stencil)},
+            level=_TIMER_LOG_LEVEL,
         ):
             match cutout_mode:
                 case CutoutMode.FULL_EXPOSURE:
@@ -543,6 +556,6 @@ class ImageCutoutFactory:
         remote_uri = self.output_root.join(output_uuid.hex + ".fits")
         with ResourcePath.temporary_uri(prefix=self.temporary_root, suffix=".fits") as tmp_uri:
             tmp_uri.parent().mkdir()
-            extract_result.write_fits(tmp_uri.ospath)
+            extract_result.write_fits(tmp_uri.ospath, logger=self.logger)
             remote_uri.transfer_from(tmp_uri, transfer="copy")
         return remote_uri

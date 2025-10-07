@@ -66,7 +66,9 @@ class ProjectionFinder(ABC):
     """
 
     @abstractmethod
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+    def find_projection(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I] | None:
         """Run the finder on the given dataset with the given butler.
 
         Parameters
@@ -76,6 +78,9 @@ class ProjectionFinder(ABC):
         butler : `Butler`
             Butler client to use for reads.  Need not support writes, and any
             default search collections will be ignored.
+        logger : `logging.Logger`, optional
+            Logger to use for timing messages.  If `None`, a default logger
+            will be used.
 
         Returns
         -------
@@ -87,7 +92,9 @@ class ProjectionFinder(ABC):
         """
         raise NotImplementedError()
 
-    def __call__(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I]:
+    def __call__(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I]:
         """Call `find_projection` but raise `LookupError` when no projection
         information is found.
 
@@ -98,6 +105,9 @@ class ProjectionFinder(ABC):
         butler : `Butler`
             Butler client to use for reads.  Need not support writes, and any
             default search collections will be ignored.
+        logger : `logging.Logger`, optional
+            Logger to use for timing messages.  If `None`, a default logger
+            will be used.
 
         Returns
         -------
@@ -107,7 +117,7 @@ class ProjectionFinder(ABC):
             Bounding box of the image dataset (or an image closely associated
             with the dataset) in pixel coordinates.
         """
-        result = self.find_projection(ref, butler)
+        result = self.find_projection(ref, butler, logger=logger)
         if result is None:
             raise LookupError(f"No way to obtain WCS and bounding box information for ref {ref}.")
         return result
@@ -144,9 +154,12 @@ class ReadComponents(ProjectionFinder):
     or yield the most accurate WCS.
     """
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+    def find_projection(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         if {"wcs", "bbox"}.issubset(ref.datasetType.storageClass.allComponents().keys()):
+            logger = logger if logger is not None else _LOG
             with time_this(_LOG, msg="Read projection info from butler components", level=_TIMER_LOG_LEVEL):
                 wcs = butler.get(ref.makeComponentRef("wcs"))
                 bbox = butler.get(ref.makeComponentRef("bbox"))
@@ -165,9 +178,12 @@ class ReadComponentsAstropyFits(ProjectionFinder):
     is needed for butler to work using AFW.
     """
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+    def find_projection(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
-        with time_this(_LOG, msg="Read projection info using Astropy", level=_TIMER_LOG_LEVEL):
+        logger = logger if logger is not None else _LOG
+        with time_this(logger, msg="Read projection info using Astropy", level=_TIMER_LOG_LEVEL):
             if {"wcs", "bbox"}.issubset(ref.datasetType.storageClass.allComponents().keys()):
                 try:
                     fs, fspath = butler.getURI(ref).to_fsspec()
@@ -219,10 +235,12 @@ class TryComponentParents(ProjectionFinder):
     def __init__(self, nested: ProjectionFinder):
         self._nested = nested
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+    def find_projection(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         while True:
-            if (result := self._nested.find_projection(ref, butler)) is not None:
+            if (result := self._nested.find_projection(ref, butler, logger=logger)) is not None:
                 return result
             if ref.isComponent():
                 ref = ref.makeCompositeRef()
@@ -258,7 +276,9 @@ class UseSkyMap(ProjectionFinder):
         self._collections = tuple(collections)
         self._cache: dict[str, BaseSkyMap] = {}
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+    def find_projection(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         if "tract" in ref.dataId.dimensions:
             assert "skymap" in ref.dataId.dimensions, "Guaranteed by expected dimension schema."
@@ -288,10 +308,12 @@ class Chain(ProjectionFinder):
     def __init__(self, *nested: ProjectionFinder):
         self._nested = tuple(nested)
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+    def find_projection(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         for f in self._nested:
-            if (result := f.find_projection(ref, butler)) is not None:
+            if (result := f.find_projection(ref, butler, logger=logger)) is not None:
                 return result
         return None
 
@@ -322,12 +344,14 @@ class MatchDatasetTypeName(ProjectionFinder):
         self._on_match = on_match
         self._otherwise = otherwise
 
-    def find_projection(self, ref: DatasetRef, butler: Butler) -> tuple[SkyWcs, Box2I] | None:
+    def find_projection(
+        self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
+    ) -> tuple[SkyWcs, Box2I] | None:
         # Docstring inherited.
         if self._regex.match(ref.datasetType.name):
             if self._on_match is not None:
-                return self._on_match.find_projection(ref, butler)
+                return self._on_match.find_projection(ref, butler, logger=logger)
         else:
             if self._otherwise is not None:
-                return self._otherwise.find_projection(ref, butler)
+                return self._otherwise.find_projection(ref, butler, logger=logger)
         return None
