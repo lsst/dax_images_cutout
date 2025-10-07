@@ -127,6 +127,7 @@ class ProjectionFinder(ABC):
         return TryComponentParents(
             Chain(
                 UseSkyMap(),
+                ReadComponentsAstropyFits(),
                 ReadComponents(),
             )
         )
