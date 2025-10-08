@@ -33,7 +33,7 @@ import astropy.io.fits
 import astropy.time
 
 import lsst.geom
-from lsst.afw.geom.wcsUtils import getImageXY0FromMetadata
+from lsst.afw.geom import getImageXY0FromMetadata, makeSkyWcs
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage, makeExposure, makeMaskedImage
 from lsst.daf.base import PropertyList
 from lsst.daf.butler import Butler, DataId, DatasetRef
@@ -342,10 +342,14 @@ class ImageCutoutFactory:
         # Timestamp of the cutout extraction.
         now = astropy.time.Time.now()
         timesys = "UTC"
-        # Get the WCS and bbox of this dataset.
-        wcs, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
-        # Transform the stencil to pixel coordinates.
-        pixel_stencil = stencil.to_pixels(wcs, bbox)
+        # Get the WCS and bbox of this dataset unless we are in astropy mode.
+        wcs = None
+        bbox = None
+        pixel_stencil = None
+        if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
+            wcs, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
+            # Transform the stencil to pixel coordinates.
+            pixel_stencil = stencil.to_pixels(wcs, bbox)
         # Somewhere to store metadata.
         metadata = PropertyList()
         # Actually read the cutout.  Leave it to the butler to cache remote
@@ -396,7 +400,6 @@ class ImageCutoutFactory:
                     pixel_components = {"image", "mask", "variance"}
                     if cutout_mode == CutoutMode.ASTROPY_IMAGE:
                         pixel_components = {"image"}
-                    bbox = pixel_stencil.bbox
                     uri = self.butler.getURI(ref)
                     fs, fspath = uri.to_fsspec()
                     hdul = []
@@ -427,6 +430,13 @@ class ImageCutoutFactory:
 
                                 # This is the PARENT bbox.
                                 full_bbox = lsst.geom.Box2I(xy0, dimensions)
+
+                                # Calculate the cutout bbox from the stencil.
+                                if pixel_stencil is None:
+                                    # Use FITS WCS.
+                                    wcs = makeSkyWcs(pl)
+                                    pixel_stencil = stencil.to_pixels(wcs, full_bbox)
+                                    bbox = pixel_stencil.bbox
 
                                 # Work out the required cutout of the HDU.
                                 minX = bbox.getBeginX() - full_bbox.getBeginX()
