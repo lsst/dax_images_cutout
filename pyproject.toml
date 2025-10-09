@@ -8,11 +8,11 @@ known_first_party = ["lsst"]
 
 [tool.black]
 line-length = 110
-target-version = ["py311"]
+target-version = ["py312"]
 
 [tool.ruff]
 line-length = 110
-target-version = "py311"
+target-version = "py312"
 exclude = [
     "__init__.py",
 ]
