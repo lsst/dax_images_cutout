@@ -513,14 +513,17 @@ class ImageCutoutFactory:
         ):
             match cutout_mode:
                 case CutoutMode.FULL_EXPOSURE:
+                    assert pixel_stencil is not None
                     cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox.to_legacy()})
                     timesys = cutout.metadata.get("TIMESYS", timesys)
                 case CutoutMode.STRIPPED_EXPOSURE:
+                    assert pixel_stencil is not None
                     cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox.to_legacy()})
                     metadata = cutout.metadata  # Track metadata externally.
                     timesys = metadata.get("TIMESYS", timesys)
                     cutout = makeExposure(cutout.maskedImage, wcs=cutout.wcs)
                 case CutoutMode.IMAGE_ONLY:
+                    assert pixel_stencil is not None
                     cutout = self.butler.get(
                         ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
@@ -529,6 +532,7 @@ class ImageCutoutFactory:
                 case CutoutMode.MASKED_IMAGE:
                     # Rely on the file being cached on first read. Faster than
                     # reading entire exposure.
+                    assert pixel_stencil is not None
                     image = self.butler.get(
                         ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
@@ -620,7 +624,7 @@ class ImageCutoutFactory:
         # lsst.images interface, the other is using Astropy to deal with
         # IMAGE and MASKED_IMAGE by using standard FITS conventions.
 
-        metadata = {}
+        metadata: dict[str, str | int] = {}
         if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
             # To reduce round-trips to an object store we want to open the file
             # once and then read out the components we need. In theory we can
