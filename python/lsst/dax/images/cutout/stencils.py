@@ -44,17 +44,10 @@ import starlink.Ast as Ast
 from astropy.coordinates import SkyCoord
 
 import lsst.sphgeom
-from lsst.afw.geom import SkyWcs
-from lsst.afw.image import Mask
 from lsst.daf.base import PropertyList
-from lsst.geom import Angle, Box2I, SpherePoint, radians
-from lsst.images import Box, GeneralFrame, NoOverlapError, SkyProjection
+from lsst.images import Box, Mask, NoOverlapError, SkyProjection
 from lsst.images.utils import round_half_down, round_half_up
-
-# Generic pixel coordinate frame used when converting a legacy ``SkyWcs``
-# into a ``SkyProjection``.  The frame identity only affects AST domain
-# labels; the unit must be pixels so ``SkyProjection`` accepts the transform.
-_PIXEL_FRAME = GeneralFrame(unit=u.pix)
+from lsst.sphgeom import Angle, LonLat, UnitVector3d
 
 
 class MaskBackend(enum.Enum):
@@ -67,24 +60,6 @@ class MaskBackend(enum.Enum):
     """Mask by testing pixel centers against the ``lsst.sphgeom`` region."""
 
 
-def _as_projection(wcs: SkyWcs | SkyProjection) -> SkyProjection:
-    """Normalize a WCS argument to a `lsst.images.SkyProjection`."""
-    if isinstance(wcs, SkyProjection):
-        return wcs
-    if isinstance(wcs, SkyWcs):
-        return SkyProjection.from_legacy(wcs, _PIXEL_FRAME)
-    raise TypeError(f"Expected SkyWcs or SkyProjection; got {type(wcs).__name__}.")
-
-
-def _as_box(bbox: Box2I | Box) -> Box:
-    """Normalize a bounding-box argument to a `lsst.images.Box`."""
-    if isinstance(bbox, Box):
-        return bbox
-    if isinstance(bbox, Box2I):
-        return Box.from_legacy(bbox)
-    raise TypeError(f"Expected Box2I or lsst.images.Box; got {type(bbox).__name__}.")
-
-
 def _round_box_from_bounds(x_min: float, x_max: float, y_min: float, y_max: float) -> Box:
     """Build an integer pixel `Box` from continuous coordinate bounds.
 
@@ -95,6 +70,15 @@ def _round_box_from_bounds(x_min: float, x_max: float, y_min: float, y_max: floa
         round_half_up(y_min) : round_half_down(y_max) + 1,
         round_half_up(x_min) : round_half_down(x_max) + 1,
     ]
+
+
+def _skycoord_from_lonlat(lonlat: LonLat) -> SkyCoord:
+    """Return an ICRS `astropy.coordinates.SkyCoord` for a `sphgeom.LonLat`."""
+    return SkyCoord(
+        ra=lonlat.getLon().asRadians() * u.rad,
+        dec=lonlat.getLat().asRadians() * u.rad,
+        frame="icrs",
+    )
 
 
 class _AstLineSource:
@@ -137,35 +121,34 @@ class PixelStencil(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def set_mask(self, mask: Mask, bits: int) -> None:
-        """Set mask planes for pixels whose centers the stencil covers.
+    def _coverage(self) -> np.ndarray:
+        """Boolean array over `bbox`, `True` for pixels the stencil covers.
 
-        Parameters
-        ----------
-        mask : `lsst.afw.image.Mask`
-            Mask to modify in-place.
-        bits : `int`
-            Integer bitmask to bitwise-OR into pixels covered by the stencil.
+        The array has shape ``bbox.shape`` (``(ny, nx)``).
         """
         raise NotImplementedError()
 
+    def set_mask(self, mask: Mask, plane: str) -> None:
+        """Set a mask plane for pixels whose centers the stencil covers.
 
-def _apply_boolean_to_mask(mask: Mask, box: Box, covered: np.ndarray, bits: int) -> None:
-    """Bitwise-OR ``bits`` into ``mask`` for the `True` entries of ``covered``.
-
-    ``covered`` must be a boolean array with shape ``box.shape``
-    (``(ny, nx)``).
-    """
-    submask = mask[box.to_legacy()]
-    submask.array[:, :] |= (bits * covered).astype(submask.array.dtype)
+        Parameters
+        ----------
+        mask : `lsst.images.Mask`
+            Mask to modify in-place.  Its schema must already define ``plane``
+            and its bounding box must contain `bbox`.
+        plane : `str`
+            Name of the mask plane to set where the stencil covers a pixel.
+        """
+        covered = self._coverage()
+        full = np.zeros(mask.bbox.shape, dtype=bool)
+        y_off = self.bbox.y.min - mask.bbox.y.min
+        x_off = self.bbox.x.min - mask.bbox.x.min
+        full[y_off : y_off + self.bbox.shape.y, x_off : x_off + self.bbox.shape.x] = covered
+        mask.set(plane, full)
 
 
 class _AstPixelRegion(PixelStencil):
     """Pixel-coordinate stencil backed by a starlink-pyast sky `Region`.
-
-    The mask is computed by rasterizing the sky region directly through the
-    sky-to-pixel mapping, so the true (great-circle) region boundary is tested
-    at each pixel center without linearizing it into pixel-space chords.
 
     Parameters
     ----------
@@ -188,7 +171,7 @@ class _AstPixelRegion(PixelStencil):
         # Docstring inherited.
         return self._bbox
 
-    def set_mask(self, mask: Mask, bits: int) -> None:
+    def _coverage(self) -> np.ndarray:
         # Docstring inherited.
         scratch = np.zeros(self._bbox.shape, dtype=np.int64)
         self._sky_region.mask(
@@ -199,7 +182,7 @@ class _AstPixelRegion(PixelStencil):
             scratch,
             1,
         )
-        _apply_boolean_to_mask(mask, self._bbox, scratch != 0, bits)
+        return scratch != 0
 
 
 class _SphgeomPixelRegion(PixelStencil):
@@ -226,12 +209,11 @@ class _SphgeomPixelRegion(PixelStencil):
         # Docstring inherited.
         return self._bbox
 
-    def set_mask(self, mask: Mask, bits: int) -> None:
+    def _coverage(self) -> np.ndarray:
         # Docstring inherited.
         grid = self._bbox.meshgrid()
         sky = self._projection.pixel_to_sky(x=grid.x.ravel(), y=grid.y.ravel())
-        covered = self._region.contains(sky.ra.radian, sky.dec.radian).reshape(self._bbox.shape)
-        _apply_boolean_to_mask(mask, self._bbox, covered, bits)
+        return self._region.contains(sky.ra.radian, sky.dec.radian).reshape(self._bbox.shape)
 
 
 class SkyStencil(ABC):
@@ -241,8 +223,8 @@ class SkyStencil(ABC):
 
     def to_pixels(
         self,
-        wcs: SkyWcs | SkyProjection,
-        bbox: Box2I | Box,
+        projection: SkyProjection,
+        bbox: Box,
         *,
         backend: MaskBackend = MaskBackend.AST,
     ) -> PixelStencil:
@@ -250,10 +232,9 @@ class SkyStencil(ABC):
 
         Parameters
         ----------
-        wcs : `lsst.afw.geom.SkyWcs` or `lsst.images.SkyProjection`
-            Mapping from sky coordinates to pixel coordinates.  A legacy
-            ``SkyWcs`` is converted to a `SkyProjection` internally.
-        bbox : `lsst.geom.Box2I` or `lsst.images.Box`
+        projection : `lsst.images.SkyProjection`
+            Mapping from sky coordinates to pixel coordinates.
+        bbox : `lsst.images.Box`
             Bounds that the returned stencil must lie within.
         backend : `MaskBackend`, optional
             Algorithm used to rasterize the stencil.  Defaults to
@@ -271,10 +252,8 @@ class SkyStencil(ABC):
             Raised when ``clip`` is `False` and the pixel-coordinate stencil
             does not lie within ``bbox``.
         """
-        projection = _as_projection(wcs)
-        box = _as_box(bbox)
         tight = self._pixel_bbox(projection)
-        final = self._resolve_box(tight, box)
+        final = self._resolve_box(tight, bbox)
         if backend is MaskBackend.AST:
             return _AstPixelRegion(self._ast_sky_region(), _starlink_sky_to_pixel(projection), final)
         if backend is MaskBackend.SPHGEOM:
@@ -317,7 +296,7 @@ class SkyStencil(ABC):
     def _boundary_skycoord(self) -> SkyCoord:
         """Return sky coordinates sampling the stencil boundary.
 
-        Used by the sphgeom backend to size the pixel bounding box.
+        Used to size the pixel bounding box.
         """
         raise NotImplementedError()
 
@@ -344,27 +323,30 @@ class SkyCircle(SkyStencil):
 
     Parameters
     ----------
-    center : `SpherePoint`
-        The center of the circle, in ICRS (ra, dec).
-    radius : `Angle`
+    center : `lsst.sphgeom.LonLat`
+        The center of the circle, in ICRS (longitude, latitude).
+    radius : `lsst.sphgeom.Angle`
         Radius of the circle.
     clip : `bool`, optional
         If `True` (`False` is default), clip pixel stencils returned by
         `to_pixels` instead of raising `StencilNotContainedError`.
-
     """
 
     #: Number of points used to sample the circle boundary when sizing the
-    #: pixel bounding box for the sphgeom backend.
+    #: pixel bounding box.
     BOUNDARY_SAMPLES = 64
 
-    def __init__(self, center: SpherePoint, radius: Angle, clip: bool = False):
+    def __init__(self, center: LonLat, radius: Angle, clip: bool = False):
         self._center = center
         self._radius = radius
         self._clip = clip
 
     def __repr__(self) -> str:
-        return f"SkyCircle({self._center!r}, {self._radius!r}, clip={self._clip!r})"
+        return (
+            f"SkyCircle(LonLat.fromRadians({self._center.getLon().asRadians()!r}, "
+            f"{self._center.getLat().asRadians()!r}), "
+            f"Angle({self._radius.asRadians()!r}), clip={self._clip!r})"
+        )
 
     @classmethod
     def from_astropy(
@@ -375,9 +357,9 @@ class SkyCircle(SkyStencil):
         Parameters
         ----------
         center : `astropy.coordinates.SkyCoord`
-            The center of the circle, in ICRS (ra, dec).
-        radius : `Angle`
-            Radius of the circle.
+            The center of the circle, in ICRS (ra, dec).  Must be scalar.
+        radius : `astropy.coordinates.Angle`
+            Radius of the circle.  Must be scalar.
         clip : `bool`, optional
             If `True` (`False` is default), clip pixel stencils returned by
             `to_pixels` instead of raising `StencilNotContainedError`.
@@ -386,14 +368,9 @@ class SkyCircle(SkyStencil):
         -------
         stencil : `SkyCircle`
             Circular stencil.
-
-        Raises
-        ------
-        ValueError
-            Raised if ``center`` or ``radius`` is not scalar-valued.
         """
         return cls(
-            center=_spherepoint_from_astropy(center),
+            center=_lonlat_from_astropy(center),
             radius=_angle_from_astropy(radius),
             clip=clip,
         )
@@ -401,7 +378,7 @@ class SkyCircle(SkyStencil):
     @classmethod
     def from_sphgeom(cls, circle: lsst.sphgeom.Circle, clip: bool = False) -> SkyCircle:
         """Construct from a `lsst.sphgeom.Circle` instance."""
-        return cls(SpherePoint(circle.getCenter()), Angle(circle.getOpeningAngle()), clip=clip)
+        return cls(LonLat(circle.getCenter()), circle.getOpeningAngle(), clip=clip)
 
     def to_polygon(self, n_vertices: int = 16) -> SkyPolygon:
         """Return a polygon sky stencil that approximates this circle.
@@ -418,43 +395,42 @@ class SkyCircle(SkyStencil):
 
         Notes
         -----
-        For large circles and/or highly nonlinear projections, this polygon
-        approximation can be mapped much more accurately to pixel coordinates.
+        This helper is retained for callers that want a polygon approximation;
+        it is no longer used by `to_pixels`, which masks the true circle.
         """
-        factor = (2 * np.pi / n_vertices) * radians
-        return SkyPolygon(
-            (self._center.offset(b * factor, self._radius) for b in range(n_vertices)), clip=self._clip
-        )
+        center = _skycoord_from_lonlat(self._center)
+        position_angle = (np.arange(n_vertices) / n_vertices * 2.0 * np.pi) * u.rad
+        radius = astropy.coordinates.Angle(self._radius.asRadians() * u.rad)
+        points = center.directional_offset_by(position_angle, radius)
+        vertices = [LonLat.fromRadians(float(p.ra.rad), float(p.dec.rad)) for p in points]
+        return SkyPolygon(vertices, clip=self._clip)
 
     def _ast_sky_region(self) -> Ast.Region:
         # Docstring inherited.
         return Ast.Circle(
             Ast.SkyFrame("System=ICRS"),
             1,
-            [self._center.getRa().asRadians(), self._center.getDec().asRadians()],
+            [self._center.getLon().asRadians(), self._center.getLat().asRadians()],
             [self._radius.asRadians()],
         )
 
     def _boundary_skycoord(self) -> SkyCoord:
         # Docstring inherited.
-        factor = (2 * np.pi / self.BOUNDARY_SAMPLES) * radians
-        points = [self._center.offset(b * factor, self._radius) for b in range(self.BOUNDARY_SAMPLES)]
-        return SkyCoord(
-            ra=[p.getRa().asRadians() for p in points] * u.rad,
-            dec=[p.getDec().asRadians() for p in points] * u.rad,
-            frame="icrs",
-        )
+        center = _skycoord_from_lonlat(self._center)
+        position_angle = (np.arange(self.BOUNDARY_SAMPLES) / self.BOUNDARY_SAMPLES * 2.0 * np.pi) * u.rad
+        radius = astropy.coordinates.Angle(self._radius.asRadians() * u.rad)
+        return center.directional_offset_by(position_angle, radius)
 
     @property
     def region(self) -> lsst.sphgeom.Region:
         # Docstring inherited.
-        return lsst.sphgeom.Circle(self._center.getVector(), self._radius)
+        return lsst.sphgeom.Circle(UnitVector3d(self._center), self._radius)
 
     def to_fits_metadata(self, metadata: PropertyList | MutableMapping[str, Any]) -> None:
         # Docstring inherited.
         metadata["ST_TYPE"] = "CIRCLE"
-        metadata["ST_RA"] = self._center.getRa().asDegrees()
-        metadata["ST_DEC"] = self._center.getDec().asDegrees()
+        metadata["ST_RA"] = self._center.getLon().asDegrees()
+        metadata["ST_DEC"] = self._center.getLat().asDegrees()
         metadata["ST_RAD"] = self._radius.asDegrees()
 
     @property
@@ -462,8 +438,8 @@ class SkyCircle(SkyStencil):
         # Docstring inherited.
         hasher = blake2b(digest_size=16)
         hasher.update(b"CIRCLE")
-        hasher.update(struct.pack("!d", self._center.getRa().asRadians()))
-        hasher.update(struct.pack("!d", self._center.getDec().asRadians()))
+        hasher.update(struct.pack("!d", self._center.getLon().asRadians()))
+        hasher.update(struct.pack("!d", self._center.getLat().asRadians()))
         hasher.update(struct.pack("!d", self._radius.asRadians()))
         return hasher.digest()
 
@@ -473,7 +449,7 @@ class SkyPolygon(SkyStencil):
 
     Parameters
     ----------
-    vertices : `Iterable` [ `SpherePoint` ]
+    vertices : `Iterable` [ `lsst.sphgeom.LonLat` ]
         Vertices of the polygon, CCW when looking out from the origin.
         Implicitly closed (the first vertex should not be duplicated as the
         last).
@@ -487,18 +463,18 @@ class SkyPolygon(SkyStencil):
     orientation may result in unspecified failures in `to_pixels`.
     """
 
-    def __init__(self, vertices: Iterable[SpherePoint], clip: bool = False):
+    def __init__(self, vertices: Iterable[LonLat], clip: bool = False):
         self._vertices = tuple(vertices)
         self._clip = clip
 
     @classmethod
     def from_astropy(cls, vertices: astropy.coordinates.SkyCoord, clip: bool = False) -> SkyPolygon:
-        """Construct from `astropy.coordinates` arguments.
+        """Construct from an array-valued `astropy.coordinates.SkyCoord`.
 
         Parameters
         ----------
         vertices : `astropy.coordinates.SkyCoord`
-            Array of vertices.  CCW when looking out from the origin.
+            Array of vertices, CCW when looking out from the origin.
             Implicitly closed (the first vertex should not be duplicated as the
             last).
         clip : `bool`, optional
@@ -510,13 +486,13 @@ class SkyPolygon(SkyStencil):
         stencil : `SkyPolygon`
             Polygon stencil.
         """
-        return cls((_spherepoint_from_astropy(v) for v in vertices), clip=clip)
+        return cls((_lonlat_from_astropy(v) for v in vertices), clip=clip)
 
     def _ast_sky_region(self) -> Ast.Region:
         # Docstring inherited.
         sky_frame = Ast.SkyFrame("System=ICRS")
-        ra = [v.getRa().asRadians() for v in self._vertices]
-        dec = [v.getDec().asRadians() for v in self._vertices]
+        ra = [v.getLon().asRadians() for v in self._vertices]
+        dec = [v.getLat().asRadians() for v in self._vertices]
         centroid = lsst.sphgeom.LonLat(self.region.getCentroid())
         probe = [centroid.getLon().asRadians(), centroid.getLat().asRadians()]
         polygon = Ast.Polygon(sky_frame, np.array([ra, dec]))
@@ -531,15 +507,15 @@ class SkyPolygon(SkyStencil):
     def _boundary_skycoord(self) -> SkyCoord:
         # Docstring inherited.
         return SkyCoord(
-            ra=[v.getRa().asRadians() for v in self._vertices] * u.rad,
-            dec=[v.getDec().asRadians() for v in self._vertices] * u.rad,
+            ra=[v.getLon().asRadians() for v in self._vertices] * u.rad,
+            dec=[v.getLat().asRadians() for v in self._vertices] * u.rad,
             frame="icrs",
         )
 
     @property
     def region(self) -> lsst.sphgeom.Region:
         # Docstring inherited.
-        return lsst.sphgeom.ConvexPolygon([v.getVector() for v in self._vertices])
+        return lsst.sphgeom.ConvexPolygon([UnitVector3d(v) for v in self._vertices])
 
     def to_fits_metadata(self, metadata: PropertyList | MutableMapping[str, Any]) -> None:
         # Docstring inherited.
@@ -549,8 +525,8 @@ class SkyPolygon(SkyStencil):
                 "TODO: FITS limitations make it difficult to serialize big stencils to the header."
             )
         for n, v in enumerate(self._vertices):
-            metadata[f"ST_RA{n:02d}"] = v.getRa().asDegrees()
-            metadata[f"ST_DEC{n:02d}"] = v.getDec().asDegrees()
+            metadata[f"ST_RA{n:02d}"] = v.getLon().asDegrees()
+            metadata[f"ST_DEC{n:02d}"] = v.getLat().asDegrees()
 
     @property
     def fingerprint(self) -> bytes:
@@ -558,12 +534,12 @@ class SkyPolygon(SkyStencil):
         hasher = blake2b(digest_size=16)
         hasher.update(b"POLYGON")
         for v in self._vertices:
-            hasher.update(struct.pack("!dd", v.getRa().asRadians(), v.getDec().asRadians()))
+            hasher.update(struct.pack("!dd", v.getLon().asRadians(), v.getLat().asRadians()))
         return hasher.digest()
 
 
 def _angle_from_astropy(angle: astropy.coordinates.Angle) -> Angle:
-    """Convert an `astropy.coordinates.Angle` to a `lsst.geom.Angle`.
+    """Convert an `astropy.coordinates.Angle` to a `lsst.sphgeom.Angle`.
 
     Parameters
     ----------
@@ -572,16 +548,16 @@ def _angle_from_astropy(angle: astropy.coordinates.Angle) -> Angle:
 
     Returns
     -------
-    angle : `lsst.geom.Angle`
-        LSST angle.
+    angle : `lsst.sphgeom.Angle`
+        Equivalent sphgeom angle.
     """
     if not angle.isscalar:
         raise ValueError("Only scalar angles are supported.")
-    return Angle(angle.rad * radians)
+    return Angle(angle.to_value(u.rad))
 
 
-def _spherepoint_from_astropy(skycoord: astropy.coordinates.SkyCoord) -> SpherePoint:
-    """Convert an `astropy.coordinates.SkyCoord` to a `lsst.geom.SpherePoint`.
+def _lonlat_from_astropy(skycoord: astropy.coordinates.SkyCoord) -> LonLat:
+    """Convert an `astropy.coordinates.SkyCoord` to a `lsst.sphgeom.LonLat`.
 
     Parameters
     ----------
@@ -590,10 +566,10 @@ def _spherepoint_from_astropy(skycoord: astropy.coordinates.SkyCoord) -> SphereP
 
     Returns
     -------
-    angle : `lsst.geom.SpherePoint`
-        LSST spherical point.
+    lonlat : `lsst.sphgeom.LonLat`
+        Equivalent spherical point.
     """
     if not skycoord.isscalar:
         raise ValueError("Only scalar coordinates are supported.")
     icrs = skycoord.transform_to("icrs")
-    return SpherePoint(icrs.ra.rad * radians, icrs.dec.rad * radians)
+    return LonLat.fromRadians(float(icrs.ra.rad), float(icrs.dec.rad))
