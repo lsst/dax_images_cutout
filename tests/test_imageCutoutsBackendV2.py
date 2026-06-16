@@ -24,9 +24,8 @@ import tempfile
 import unittest
 
 import astropy.io.fits
+import astropy.units as u
 
-import lsst.afw.image
-import lsst.geom
 import lsst.images
 import lsst.resources
 import lsst.sphgeom
@@ -52,7 +51,7 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
 
         # Image roughly at 19:42:31 -25:36:32
         point = lsst.sphgeom.LonLat.fromDegrees(295.629167, -25.608889)
-        radius = lsst.sphgeom.Angle((10 * lsst.geom.arcseconds).asRadians())
+        radius = lsst.sphgeom.Angle((10 * u.arcsec).to_value(u.rad))
         self.stencil = stencils.SkyCircle(point, radius)
 
         self.projectionFinders = (

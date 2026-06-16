@@ -25,15 +25,22 @@ import unittest
 
 import astropy.io.fits
 
-import lsst.afw.image
 import lsst.daf.butler
-import lsst.geom
 import lsst.resources
 import lsst.sphgeom
 import lsst.utils.tests
 from lsst.dax.images.cutout import CutoutMode, ImageCutoutFactory, projection_finders, stencils
 
+try:
+    import lsst.afw.image
+    import lsst.geom
 
+    HAVE_AFW = True
+except ImportError:
+    HAVE_AFW = False
+
+
+@unittest.skipUnless(HAVE_AFW, "lsst.afw not available")
 class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
     """Tests for ImageCutoutsBackend."""
 
