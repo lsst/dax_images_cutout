@@ -1,0 +1,8 @@
+lsst-daf-butler @ git+https://github.com/lsst/daf_butler@main
+lsst-images @ git+https://github.com/lsst/images@main
+starlink-pyast >= 4.0.1
+numpy
+astropy
+lsst-sphgeom
+lsst-resources
+lsst-utils
