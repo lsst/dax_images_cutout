@@ -123,6 +123,9 @@ class PixelPolygon(PixelStencil):
         submask = mask[self.bbox]
         submask.array[:, :] |= bits * (image.array > 0.5)
 
+    def __str__(self) -> str:
+        return repr(self._bbox)
+
 
 class SkyStencil(ABC):
     """An image cutout stencil defined in sky (ICRS) coordinates."""
