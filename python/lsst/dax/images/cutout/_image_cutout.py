@@ -558,6 +558,8 @@ class ImageCutoutFactory:
         metadata.set("DATE-CUT", str(now), "Time of cutout extraction")
         metadata.set("CUTVERS", __version__, "dax_images_cutout software version")
 
+        # Every supported cutout mode produces a pixel stencil above.
+        assert pixel_stencil is not None
         return Extraction(
             cutout=cutout,
             sky_stencil=stencil,
@@ -685,6 +687,8 @@ class ImageCutoutFactory:
         metadata["DATE-CUT"] = str(now)
         metadata["CUTVERS"] = __version__
 
+        # Every supported cutout mode produces a pixel stencil above.
+        assert pixel_stencil is not None
         return Extraction(
             cutout=cutout,
             sky_stencil=stencil,

@@ -31,13 +31,17 @@ from __future__ import annotations
 
 import timeit
 
-from lsst.afw.geom import makeCdMatrix, makeSkyWcs
-from lsst.afw.image import Mask
-from lsst.dax.images.cutout.stencils import MaskBackend, SkyCircle
-from lsst.geom import Angle, Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
+import astropy.units as u
 
-CENTER = SpherePoint(12.0, 13.0, degrees)
-WCS = makeSkyWcs(Point2D(0.0, 0.0), CENTER, makeCdMatrix(0.2 * arcseconds))
+from lsst.afw.geom import makeCdMatrix, makeSkyWcs
+from lsst.dax.images.cutout.stencils import MaskBackend, SkyCircle
+from lsst.geom import Point2D, SpherePoint, arcseconds, degrees
+from lsst.images import Box, GeneralFrame, Mask, MaskPlane, MaskSchema, SkyProjection
+from lsst.sphgeom import Angle, LonLat
+
+CENTER = LonLat.fromDegrees(12.0, 13.0)
+_WCS = makeSkyWcs(Point2D(0.0, 0.0), SpherePoint(12.0, 13.0, degrees), makeCdMatrix(0.2 * arcseconds))
+PROJECTION = SkyProjection.from_legacy(_WCS, GeneralFrame(unit=u.pix))
 
 # (label, circle radius in arcsec, half-size of the square bbox in pixels).
 CASES = (
@@ -48,16 +52,20 @@ CASES = (
 REPEATS = 20
 
 
+def _arcsec(value: float) -> Angle:
+    """Return a `lsst.sphgeom.Angle` for ``value`` arcseconds."""
+    return Angle((value * u.arcsec).to_value(u.rad))
+
+
 def _run(radius_arcsec: float, half: int, backend: MaskBackend) -> float:
-    stencil = SkyCircle(CENTER, Angle(radius_arcsec, arcseconds))
-    bbox = Box2I(Point2I(-half, -half), Point2I(half, half))
+    stencil = SkyCircle(CENTER, _arcsec(radius_arcsec))
+    box = Box.factory[-half : half + 1, -half : half + 1]
+    schema = MaskSchema([MaskPlane("STENCIL", "stencil coverage")])
 
     def once() -> None:
-        pixel_stencil = stencil.to_pixels(WCS, bbox, backend=backend)
-        mask = Mask(bbox)
-        mask.addMaskPlane("STENCIL")
-        bits = mask.getPlaneBitMask("STENCIL")
-        pixel_stencil.set_mask(mask, bits)
+        pixel_stencil = stencil.to_pixels(PROJECTION, box, backend=backend)
+        mask = Mask(schema=schema, bbox=box)
+        pixel_stencil.set_mask(mask, "STENCIL")
 
     return min(timeit.repeat(once, number=1, repeat=REPEATS))
 
