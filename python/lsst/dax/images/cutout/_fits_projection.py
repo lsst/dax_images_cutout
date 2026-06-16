@@ -72,15 +72,21 @@ def projection_and_bbox_from_fits_header(
     ``SkyProjection.from_fits_header``).
     """
     frame_set = _ast.FitsChan(_ast.StringStream(header.tostring())).read()
-    projection = SkyProjection.from_ast_frame_set(frame_set, _PIXEL_FRAME)
-
     parent_index = _frame_index_by_ident(frame_set, _PARENT_WCS_IDENT)
+
+    # The base frame is the raw 1-based pixel grid; the "A" frame is the parent
+    # pixel system that carries the XY0 origin.  Read XY0 as the parent
+    # coordinate of grid (1, 1) before retargeting, then build the projection
+    # on the parent frame so its pixels match the parent bounding box (and the
+    # legacy ``makeSkyWcs`` convention).
     grid_to_parent = frame_set.getMapping(frame_set.base, parent_index)
-    # AST GRID coordinates are 1-based, so grid (1, 1) is the first pixel; its
-    # parent coordinate is the integer XY0 origin.
     origin = grid_to_parent.applyForward(np.array([[1.0], [1.0]])).ravel()
     x0 = int(round(float(origin[0])))
     y0 = int(round(float(origin[1])))
+
+    frame_set.base = parent_index
+    projection = SkyProjection.from_ast_frame_set(frame_set, _PIXEL_FRAME)
+
     ny, nx = int(shape[0]), int(shape[1])
     bbox = Box.factory[y0 : y0 + ny, x0 : x0 + nx]
     return projection, bbox

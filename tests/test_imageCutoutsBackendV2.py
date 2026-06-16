@@ -29,6 +29,7 @@ import lsst.afw.image
 import lsst.geom
 import lsst.images
 import lsst.resources
+import lsst.sphgeom
 import lsst.utils.tests
 from lsst.daf.butler import Butler
 from lsst.dax.images.cutout import CutoutMode, ImageCutoutFactory, projection_finders, stencils
@@ -50,8 +51,8 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
         self.enterContext(self.butler)
 
         # Image roughly at 19:42:31 -25:36:32
-        point = lsst.geom.SpherePoint(295.629167 * lsst.geom.degrees, -25.608889 * lsst.geom.degrees)
-        radius = 10 * lsst.geom.arcseconds
+        point = lsst.sphgeom.LonLat.fromDegrees(295.629167, -25.608889)
+        radius = lsst.sphgeom.Angle((10 * lsst.geom.arcseconds).asRadians())
         self.stencil = stencils.SkyCircle(point, radius)
 
         self.projectionFinders = (

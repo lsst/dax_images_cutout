@@ -26,7 +26,7 @@ import unittest
 import astropy.io.fits
 import numpy as np
 
-from lsst.afw.geom import getImageXY0FromMetadata
+from lsst.afw.geom import getImageXY0FromMetadata, makeSkyWcs
 from lsst.daf.base import PropertyList
 from lsst.dax.images.cutout._fits_projection import projection_and_bbox_from_fits_header
 from lsst.geom import Box2I, Extent2I
@@ -68,13 +68,21 @@ class FitsProjectionTestCase(unittest.TestCase):
         # (ny, nx) as returned by astropy ``hdu.shape``.
         self.shape = (64, 48)
 
-    def test_projection_round_trips_reference_pixel(self) -> None:
-        projection, _ = projection_and_bbox_from_fits_header(self.header, self.shape)
+    def test_projection_matches_afw(self) -> None:
+        projection, bbox = projection_and_bbox_from_fits_header(self.header, self.shape)
         self.assertIsInstance(projection, SkyProjection)
-        sky = projection.pixel_to_sky(x=np.array([10.0]), y=np.array([20.0]))
-        # The reference pixel CRPIX maps to CRVAL.
-        self.assertAlmostEqual(float(sky.ra.deg[0]), 12.0, places=6)
-        self.assertAlmostEqual(float(sky.dec.deg[0]), 13.0, places=6)
+        # The projection is in parent pixel coordinates, matching the legacy
+        # afw ``makeSkyWcs`` reference; sample a few parent pixels in the bbox.
+        pl = PropertyList()
+        pl.update(self.header)
+        wcs = makeSkyWcs(pl)
+        xs = np.array([bbox.x.start + 5.0, bbox.x.start + 30.0])
+        ys = np.array([bbox.y.start + 7.0, bbox.y.start + 25.0])
+        sky = projection.pixel_to_sky(x=xs, y=ys)
+        for i in range(len(xs)):
+            reference = wcs.pixelToSky(float(xs[i]), float(ys[i]))
+            self.assertAlmostEqual(float(sky.ra.deg[i]), reference.getRa().asDegrees(), places=6)
+            self.assertAlmostEqual(float(sky.dec.deg[i]), reference.getDec().asDegrees(), places=6)
 
     def test_bbox_matches_afw_reference(self) -> None:
         _, bbox = projection_and_bbox_from_fits_header(self.header, self.shape)

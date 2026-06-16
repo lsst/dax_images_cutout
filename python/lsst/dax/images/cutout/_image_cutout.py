@@ -32,18 +32,19 @@ from uuid import UUID, uuid4
 import astropy.io.fits
 import astropy.time
 
-import lsst.geom
 import lsst.images
 import lsst.images.serialization
-from lsst.afw.geom import getImageXY0FromMetadata, makeSkyWcs
 from lsst.afw.image import Exposure, Image, Mask, MaskedImage, makeExposure, makeMaskedImage
 from lsst.daf.base import PropertyList
 from lsst.daf.butler import Butler, DataId, DatasetRef
+from lsst.images import Box, MaskPlane, MaskSchema
+from lsst.images import Mask as ImagesMask
 from lsst.images.fits import DEFAULT_PAGE_SIZE, READ_CACHE_MAX_BYTES, ExtensionKey
 from lsst.images.fits._input_archive import _READ_CACHE_TYPE
 from lsst.resources import ResourcePath, ResourcePathExpression
 from lsst.utils.timer import time_this
 
+from ._fits_projection import projection_and_bbox_from_fits_header
 from .projection_finders import ProjectionFinder
 from .stencils import PixelStencil, SkyStencil
 from .version import __version__
@@ -114,7 +115,10 @@ class Extraction:
         """
         if isinstance(self.cutout, lsst.images.MaskedImage):
             mask = self.cutout.mask
-            # Need to add the code for masking a lsst.images object.
+            # Adding a new plane to an lsst.images.Mask after construction is
+            # not yet supported; set the plane only if it already exists.
+            if name in mask.schema.names:
+                self.pixel_stencil.set_mask(mask, name)
             return
         if isinstance(self.cutout, Exposure):
             mask = self.cutout.mask
@@ -124,9 +128,17 @@ class Extraction:
             mask = self.cutout
         else:
             return
+        # Stage the coverage in an lsst.images.Mask, then OR it into the afw
+        # mask plane so stencils never sees an afw object.
+        images_mask = ImagesMask(
+            schema=MaskSchema([MaskPlane(name, "stencil coverage")]),
+            bbox=Box.from_legacy(mask.getBBox()),
+        )
+        self.pixel_stencil.set_mask(images_mask, name)
+        covered = images_mask.get(name)
         mask.addMaskPlane(name)
         bits = mask.getPlaneBitMask(name)
-        self.pixel_stencil.set_mask(mask, bits)
+        mask.array[:, :] |= (bits * covered).astype(mask.array.dtype)
 
     def write_fits(self, path: str, logger: logging.Logger | None = None) -> None:
         """Write the cutout to a FITS file.
@@ -352,6 +364,89 @@ class ImageCutoutFactory:
             return self._extract_ref_v2(stencil, ref, cutout_mode=cutout_mode)
         return self._extract_ref_legacy(stencil, ref, cutout_mode=cutout_mode)
 
+    def _read_astropy_hdulist(
+        self,
+        stencil: SkyStencil,
+        ref: DatasetRef,
+        pixel_components: set[str],
+        fsspec_kwargs: dict[str, object],
+    ) -> tuple[astropy.io.fits.HDUList, PixelStencil | None, str]:
+        """Read the primary header and pixel HDUs, cut to the stencil.
+
+        Parameters
+        ----------
+        stencil : `SkyStencil`
+            Sky-coordinate stencil defining the cutout region.
+        ref : `DatasetRef`
+            Resolved reference to the dataset to read.
+        pixel_components : `set` [ `str` ]
+            Lower-case EXTNAMEs to extract (e.g. ``{"image"}``).  Consumed in
+            place as components are found.
+        fsspec_kwargs : `dict`
+            Keyword arguments forwarded to ``fsspec`` ``open``.
+
+        Returns
+        -------
+        hdulist : `astropy.io.fits.HDUList`
+            Primary HDU plus one cutout HDU per requested pixel component.
+        pixel_stencil : `PixelStencil` or `None`
+            Pixel-coordinate stencil computed from the first pixel HDU, or
+            `None` if no pixel HDU was found.
+        timesys : `str`
+            ``TIMESYS`` from the primary header, or ``"UTC"``.
+        """
+        timesys = "UTC"
+        pixel_stencil: PixelStencil | None = None
+        bbox: Box | None = None
+        uri = self.butler.getURI(ref)
+        fs, fspath = uri.to_fsspec()
+        hdul: list[astropy.io.fits.hdu.base.ExtensionHDU] = []
+        found_primary = False
+        with fs.open(fspath, **fsspec_kwargs) as f, astropy.io.fits.open(f) as fits_obj:
+            for hdu in fits_obj:
+                if not found_primary:
+                    hdul.append(hdu.copy())
+                    timesys = hdul[0].header.get("TIMESYS", timesys)
+                    found_primary = True
+                    continue
+
+                hdr = hdu.header
+                extname = hdr.get("EXTNAME")
+                if extname and extname.lower() in pixel_components:
+                    pixel_components.remove(extname.lower())
+                    projection, full_bbox = projection_and_bbox_from_fits_header(hdr, hdu.shape)
+                    if pixel_stencil is None:
+                        pixel_stencil = stencil.to_pixels(projection, full_bbox)
+                        bbox = pixel_stencil.bbox
+
+                    assert bbox is not None
+                    # Offsets of the cutout within the full HDU (array order).
+                    min_x = bbox.x.start - full_bbox.x.start
+                    max_x = bbox.x.stop - full_bbox.x.start
+                    min_y = bbox.y.start - full_bbox.y.start
+                    max_y = bbox.y.stop - full_bbox.y.start
+                    data = hdu.section[min_y:max_y, min_x:max_x].copy()
+
+                    # Correct the header WCS for the cutout offset.
+                    if (k := "CRPIX1") in hdr:
+                        hdr[k] -= min_x
+                    if (k := "CRPIX2") in hdr:
+                        hdr[k] -= min_y
+                    if (k := "LTV1") in hdr:
+                        hdr[k] = -bbox.x.start
+                    if (k := "LTV2") in hdr:
+                        hdr[k] = -bbox.y.start
+                    if (k := "CRVAL1A") in hdr:
+                        hdr[k] = bbox.x.start
+                    if (k := "CRVAL2A") in hdr:
+                        hdr[k] = bbox.y.start
+
+                    hdul.append(astropy.io.fits.ImageHDU(data=data, header=hdr.copy()))
+
+                if not pixel_components:
+                    break
+        return astropy.io.fits.HDUList(hdus=hdul), pixel_stencil, timesys
+
     def _extract_ref_legacy(
         self, stencil: SkyStencil, ref: DatasetRef, cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE
     ) -> Extraction:
@@ -385,9 +480,9 @@ class ImageCutoutFactory:
         bbox = None
         pixel_stencil = None
         if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
-            wcs, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
+            projection, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
             # Transform the stencil to pixel coordinates.
-            pixel_stencil = stencil.to_pixels(wcs, bbox)
+            pixel_stencil = stencil.to_pixels(projection, bbox)
         # Somewhere to store metadata.
         metadata = PropertyList()
         # Actually read the cutout.  Leave it to the butler to cache remote
@@ -432,83 +527,16 @@ class ImageCutoutFactory:
                     metadata = self.butler.get(ref.makeComponentRef("metadata"))
                     timesys = metadata.get("TIMESYS", timesys)
                 case CutoutMode.ASTROPY_IMAGE | CutoutMode.ASTROPY_MASKED_IMAGE:
-                    # Bypass butler and try to find the pixel HDU directly.
-                    # Approximate WCS is attached to DP1 image data but needs
-                    # to be shifted.
-                    pixel_components = {"image", "mask", "variance"}
-                    if cutout_mode == CutoutMode.ASTROPY_IMAGE:
-                        pixel_components = {"image"}
-                    uri = self.butler.getURI(ref)
-                    fs, fspath = uri.to_fsspec()
-                    hdul = []
-                    # Want the primary header and the requested pixel HDU.
-                    # Stop scanning once IMAGE has been located.
-                    found_primary = False
-                    with fs.open(fspath) as f, astropy.io.fits.open(f) as fits_obj:
-                        for hdu in fits_obj:
-                            if not found_primary:
-                                hdul.append(hdu.copy())
-                                timesys = hdul[0].header.get("TIMESYS", timesys)
-                                found_primary = True
-                                continue
-
-                            hdr = hdu.header
-                            extname = hdr.get("EXTNAME")
-                            if extname and extname.lower() in pixel_components:
-                                pixel_components.remove(extname.lower())
-                                # Get BBOX for full HDU.
-                                # Use shape to prevent reading the data array.
-                                shape = hdu.shape
-                                dimensions = lsst.geom.Extent2I(shape[1], shape[0])
-
-                                # XY0 is defined in the A WCS.
-                                pl = PropertyList()
-                                pl.update(hdr)
-                                xy0 = getImageXY0FromMetadata(pl, "A", strip=False)
-
-                                # This is the PARENT bbox.
-                                full_bbox = lsst.geom.Box2I(xy0, dimensions)
-
-                                # Calculate the cutout bbox from the stencil.
-                                if pixel_stencil is None:
-                                    # Use FITS WCS.
-                                    wcs = makeSkyWcs(pl)
-                                    pixel_stencil = stencil.to_pixels(wcs, full_bbox)
-                                    bbox = pixel_stencil.bbox.to_legacy()
-
-                                # Work out the required cutout of the HDU.
-                                minX = bbox.getBeginX() - full_bbox.getBeginX()
-                                maxX = bbox.getEndX() - full_bbox.getBeginX()
-                                minY = bbox.getBeginY() - full_bbox.getBeginY()
-                                maxY = bbox.getEndY() - full_bbox.getBeginY()
-                                # Get the cutout and detach from remote.
-                                data = hdu.section[minY:maxY, minX:maxX].copy()
-
-                                # Must correct the header WCS to take into
-                                # account the offset.
-                                if (k := "CRPIX1") in hdr:
-                                    hdr[k] -= minX
-                                if (k := "CRPIX2") in hdr:
-                                    hdr[k] -= minY
-                                if (k := "LTV1") in hdr:
-                                    hdr[k] = -bbox.getBeginX()
-                                if (k := "LTV2") in hdr:
-                                    hdr[k] = -bbox.getBeginY()
-                                if (k := "CRVAL1A") in hdr:
-                                    hdr[k] = bbox.getBeginX()
-                                if (k := "CRVAL2A") in hdr:
-                                    hdr[k] = bbox.getBeginY()
-
-                                # Create new HDU with the cutout.
-                                cutout_hdu = astropy.io.fits.ImageHDU(data=data, header=hdr.copy())
-                                hdul.append(cutout_hdu)
-
-                            # Stop looking for HDUs.
-                            if not pixel_components:
-                                break
-
+                    # Bypass butler and read the pixel HDU directly.
+                    pixel_components = (
+                        {"image"}
+                        if cutout_mode == CutoutMode.ASTROPY_IMAGE
+                        else {"image", "mask", "variance"}
+                    )
                     # TODO: Convert this to a lsst.images type.
-                    cutout = astropy.io.fits.HDUList(hdus=hdul)
+                    cutout, pixel_stencil, timesys = self._read_astropy_hdulist(
+                        stencil, ref, pixel_components, {}
+                    )
                 case _:
                     raise ValueError(f"Unsupported cutout mode: {cutout_mode}")
 
@@ -616,10 +644,6 @@ class ImageCutoutFactory:
 
         else:
             # This is the Astropy direct branch.
-            wcs = None
-            bbox = None
-
-            # Start timer from first read.
             with time_this(
                 self.logger,
                 msg="Extract cutout",
@@ -629,90 +653,19 @@ class ImageCutoutFactory:
                 if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
                     raise ValueError(f"Unexpected cutout mode {cutout_mode} encountered")
 
-                # Bypass butler and try to find the pixel HDU directly.
-                # Approximate WCS is attached to image data but needs
-                # to be shifted.
-                pixel_components = {"image", "mask", "variance"}
-                if cutout_mode == CutoutMode.ASTROPY_IMAGE:
-                    pixel_components = {"image"}
-                uri = self.butler.getURI(ref)
-                fs, fspath = uri.to_fsspec()
-                hdul = []
-
-                # Tune the fsspec cache to match what we use in lsst.images
+                pixel_components = (
+                    {"image"} if cutout_mode == CutoutMode.ASTROPY_IMAGE else {"image", "mask", "variance"}
+                )
+                # Tune the fsspec cache to match what we use in lsst.images.
                 maxblocks = max(2, READ_CACHE_MAX_BYTES // DEFAULT_PAGE_SIZE)
                 fsspec_kwargs = {
                     "block_size": DEFAULT_PAGE_SIZE,
                     "cache_type": _READ_CACHE_TYPE,
                     "cache_options": {"maxblocks": maxblocks},
                 }
-
-                # Want the primary header and the requested pixel HDU.
-                # Stop scanning once IMAGE has been located.
-                found_primary = False
-                with fs.open(fspath, **fsspec_kwargs) as f, astropy.io.fits.open(f) as fits_obj:
-                    for hdu in fits_obj:
-                        if not found_primary:
-                            hdul.append(hdu.copy())
-                            timesys = hdul[0].header.get("TIMESYS", timesys)
-                            found_primary = True
-                            continue
-
-                        hdr = hdu.header
-                        extname = hdr.get("EXTNAME")
-                        if extname and extname.lower() in pixel_components:
-                            pixel_components.remove(extname.lower())
-                            # Get BBOX for full HDU.
-                            # Use shape to prevent reading the data array.
-                            shape = hdu.shape
-                            dimensions = lsst.geom.Extent2I(shape[1], shape[0])
-
-                            # XY0 is defined in the A WCS.
-                            pl = PropertyList()
-                            pl.update(hdr)
-                            xy0 = getImageXY0FromMetadata(pl, "A", strip=False)
-
-                            # This is the PARENT bbox.
-                            full_bbox = lsst.geom.Box2I(xy0, dimensions)
-
-                            # Calculate the cutout bbox from the stencil.
-                            if pixel_stencil is None:
-                                # Use FITS WCS.
-                                wcs = makeSkyWcs(pl)
-                                pixel_stencil = stencil.to_pixels(wcs, full_bbox)
-                                bbox = pixel_stencil.bbox.to_legacy()
-
-                            # Work out the required cutout of the HDU.
-                            minX = bbox.getBeginX() - full_bbox.getBeginX()
-                            maxX = bbox.getEndX() - full_bbox.getBeginX()
-                            minY = bbox.getBeginY() - full_bbox.getBeginY()
-                            maxY = bbox.getEndY() - full_bbox.getBeginY()
-                            # Get the cutout and detach from remote.
-                            data = hdu.section[minY:maxY, minX:maxX].copy()
-
-                            # Must correct the header WCS to take into
-                            # account the offset.
-                            if (k := "CRPIX1") in hdr:
-                                hdr[k] -= minX
-                            if (k := "CRPIX2") in hdr:
-                                hdr[k] -= minY
-                            if (k := "LTV1") in hdr:
-                                hdr[k] = -bbox.getBeginX()
-                            if (k := "LTV2") in hdr:
-                                hdr[k] = -bbox.getBeginY()
-                            if (k := "CRVAL1A") in hdr:
-                                hdr[k] = bbox.getBeginX()
-                            if (k := "CRVAL2A") in hdr:
-                                hdr[k] = bbox.getBeginY()
-
-                            # Create new HDU with the cutout.
-                            cutout_hdu = astropy.io.fits.ImageHDU(data=data, header=hdr.copy())
-                            hdul.append(cutout_hdu)
-
-                        # Stop looking for HDUs.
-                        if not pixel_components:
-                            break
-                cutout = astropy.io.fits.HDUList(hdus=hdul)
+                cutout, pixel_stencil, timesys = self._read_astropy_hdulist(
+                    stencil, ref, pixel_components, fsspec_kwargs
+                )
 
         # Create some FITS metadata with the cutout parameters.
         # Some of these are added as provenance by the butler on write so may

@@ -29,6 +29,7 @@ import lsst.afw.image
 import lsst.daf.butler
 import lsst.geom
 import lsst.resources
+import lsst.sphgeom
 import lsst.utils.tests
 from lsst.dax.images.cutout import CutoutMode, ImageCutoutFactory, projection_finders, stencils
 
@@ -48,8 +49,8 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
         self.butler = lsst.daf.butler.Butler(os.path.join(self.data_dir, "repo"), collections=collection)
 
         # Centered on a galaxy
-        point = lsst.geom.SpherePoint(56.6400770 * lsst.geom.degrees, -36.4492250 * lsst.geom.degrees)
-        radius = 10 * lsst.geom.arcseconds
+        point = lsst.sphgeom.LonLat.fromDegrees(56.6400770, -36.4492250)
+        radius = lsst.sphgeom.Angle((10 * lsst.geom.arcseconds).asRadians())
         self.stencil = stencils.SkyCircle(point, radius)
 
         self.projectionFinders = (
