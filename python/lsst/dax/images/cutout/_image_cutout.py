@@ -27,6 +27,7 @@ import dataclasses
 import logging
 from collections.abc import Sequence
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import astropy.io.fits
@@ -34,8 +35,6 @@ import astropy.time
 
 import lsst.images
 import lsst.images.serialization
-from lsst.afw.image import Exposure, Image, Mask, MaskedImage, makeExposure, makeMaskedImage
-from lsst.daf.base import PropertyList
 from lsst.daf.butler import Butler, DataId, DatasetRef
 from lsst.images import Box, MaskPlane, MaskSchema
 from lsst.images import Mask as ImagesMask
@@ -48,6 +47,11 @@ from ._fits_projection import projection_and_bbox_from_fits_header
 from .projection_finders import ProjectionFinder
 from .stencils import PixelStencil, SkyStencil
 from .version import __version__
+
+if TYPE_CHECKING:
+    from lsst.afw.image import Exposure, Image, Mask, MaskedImage
+    from lsst.daf.base import PropertyList
+
 
 # Default logger.
 _LOG = logging.getLogger(__name__)
@@ -120,14 +124,23 @@ class Extraction:
             if name in mask.schema.names:
                 self.pixel_stencil.set_mask(mask, name)
             return
-        if isinstance(self.cutout, Exposure):
-            mask = self.cutout.mask
-        elif isinstance(self.cutout, MaskedImage):
-            mask = self.cutout.mask
-        elif isinstance(self.cutout, Mask):
-            mask = self.cutout
-        else:
+
+        # Try afw variants. Protect the imports (if the imports fail it is
+        # not possible for it to be an afe type).
+        try:
+            from lsst.afw.image import Exposure, Mask, MaskedImage
+
+            match self.cutout:
+                case Exposure() | MaskedImage():
+                    mask = self.cutout.mask
+                case Mask():
+                    mask = self.cutout
+                case _:
+                    return
+        except ImportError:
+            # Can not determine the type so do not mask anything.
             return
+
         # Stage the coverage in an lsst.images.Mask, then OR it into the afw
         # mask plane so stencils never sees an afw object.
         images_mask = ImagesMask(
@@ -162,8 +175,8 @@ class Extraction:
             if isinstance(self.cutout, lsst.images.GeneralizedImage):
                 self.cutout.metadata.update(self.metadata)  # Or store in opaque metadata.
                 self.cutout.write(path)
-            elif isinstance(self.cutout, Exposure):
-                self.cutout.getMetadata().update(self.metadata)
+            elif hasattr(self.cutout, "getMetadata") and hasattr(self.cutout, "writeFits"):
+                self.cutout.metadata.update(self.metadata)
                 self.cutout.writeFits(path)
             elif isinstance(self.cutout, astropy.io.fits.HDUList):
                 self.cutout[0].header.update(self.metadata)
@@ -470,6 +483,11 @@ class ImageCutoutFactory:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
+        # We know that afw and daf_base are available here since we received
+        # an afw Exposure.
+        from lsst.afw.image import makeExposure, makeMaskedImage
+        from lsst.daf.base import PropertyList
+
         if ref.id is None:
             raise ValueError(f"A resolved DatasetRef is required; got {ref}.")
         # Timestamp of the cutout extraction.
