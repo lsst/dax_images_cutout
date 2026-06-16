@@ -35,17 +35,22 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 import astropy.io.fits
 import astropy.units as u
 
 from lsst.daf.butler import Butler, DatasetRef
 from lsst.images import Box, GeneralFrame, SkyProjection
-from lsst.skymap import BaseSkyMap
 from lsst.utils.timer import time_this
 
 from ._fits_projection import projection_and_bbox_from_fits_header
+
+if TYPE_CHECKING:
+    try:
+        from lsst.skymap import BaseSkyMap
+    except ImportError:
+        type BaseSkyMap = Any
 
 # Pixel coordinate frame for projections built from afw SkyWcs objects.
 _PIXEL_FRAME = GeneralFrame(unit=u.pix)
