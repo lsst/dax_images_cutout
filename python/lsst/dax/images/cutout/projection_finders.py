@@ -35,7 +35,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import astropy.io.fits
 import astropy.units as u
@@ -47,10 +47,9 @@ from lsst.utils.timer import time_this
 from ._fits_projection import projection_and_bbox_from_fits_header
 
 if TYPE_CHECKING:
-    try:
-        from lsst.skymap import BaseSkyMap
-    except ImportError:
-        type BaseSkyMap = Any
+    # lsst.skymap ships only with the Science Pipelines, not on PyPI; the
+    # mypy config ignores it when missing, and it is never imported at runtime.
+    from lsst.skymap import BaseSkyMap
 
 # Pixel coordinate frame for projections built from afw SkyWcs objects.
 _PIXEL_FRAME = GeneralFrame(unit=u.pix)
