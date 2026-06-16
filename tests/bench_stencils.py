@@ -32,16 +32,14 @@ from __future__ import annotations
 import timeit
 
 import astropy.units as u
+import astropy.wcs
 
-from lsst.afw.geom import makeCdMatrix, makeSkyWcs
 from lsst.dax.images.cutout.stencils import MaskBackend, SkyCircle
-from lsst.geom import Point2D, SpherePoint, arcseconds, degrees
 from lsst.images import Box, GeneralFrame, Mask, MaskPlane, MaskSchema, SkyProjection
 from lsst.sphgeom import Angle, LonLat
 
 CENTER = LonLat.fromDegrees(12.0, 13.0)
-_WCS = makeSkyWcs(Point2D(0.0, 0.0), SpherePoint(12.0, 13.0, degrees), makeCdMatrix(0.2 * arcseconds))
-PROJECTION = SkyProjection.from_legacy(_WCS, GeneralFrame(unit=u.pix))
+PIXEL_SCALE = 0.2  # arcsec/pixel
 
 # (label, circle radius in arcsec, half-size of the square bbox in pixels).
 CASES = (
@@ -57,13 +55,24 @@ def _arcsec(value: float) -> Angle:
     return Angle((value * u.arcsec).to_value(u.rad))
 
 
-def _run(radius_arcsec: float, half: int, backend: MaskBackend) -> float:
+def _projection() -> SkyProjection:
+    """Build a gnomonic `SkyProjection` centered on ``CENTER``."""
+    wcs = astropy.wcs.WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.crval = [CENTER.getLon().asDegrees(), CENTER.getLat().asDegrees()]
+    scale = PIXEL_SCALE / 3600.0
+    wcs.wcs.cd = [[-scale, 0.0], [0.0, scale]]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    return SkyProjection.from_fits_wcs(wcs, GeneralFrame(unit=u.pix))
+
+
+def _run(projection: SkyProjection, radius_arcsec: float, half: int, backend: MaskBackend) -> float:
     stencil = SkyCircle(CENTER, _arcsec(radius_arcsec))
     box = Box.factory[-half : half + 1, -half : half + 1]
     schema = MaskSchema([MaskPlane("STENCIL", "stencil coverage")])
 
     def once() -> None:
-        pixel_stencil = stencil.to_pixels(PROJECTION, box, backend=backend)
+        pixel_stencil = stencil.to_pixels(projection, box, backend=backend)
         mask = Mask(schema=schema, bbox=box)
         pixel_stencil.set_mask(mask, "STENCIL")
 
@@ -72,11 +81,12 @@ def _run(radius_arcsec: float, half: int, backend: MaskBackend) -> float:
 
 def main() -> None:
     """Print a table of best-of-N timings for each backend and cutout size."""
+    projection = _projection()
     print(f"{'case':>8} {'bbox':>12} {'AST (ms)':>12} {'SPHGEOM (ms)':>14}")
     for label, radius_arcsec, half in CASES:
         side = 2 * half + 1
-        ast_ms = _run(radius_arcsec, half, MaskBackend.AST) * 1e3
-        sph_ms = _run(radius_arcsec, half, MaskBackend.SPHGEOM) * 1e3
+        ast_ms = _run(projection, radius_arcsec, half, MaskBackend.AST) * 1e3
+        sph_ms = _run(projection, radius_arcsec, half, MaskBackend.SPHGEOM) * 1e3
         print(f"{label:>8} {f'{side}x{side}':>12} {ast_ms:>12.3f} {sph_ms:>14.3f}")
 
 

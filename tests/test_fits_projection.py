@@ -26,11 +26,17 @@ import unittest
 import astropy.io.fits
 import numpy as np
 
-from lsst.afw.geom import getImageXY0FromMetadata, makeSkyWcs
-from lsst.daf.base import PropertyList
 from lsst.dax.images.cutout._fits_projection import projection_and_bbox_from_fits_header
-from lsst.geom import Box2I, Extent2I
 from lsst.images import Box, SkyProjection
+
+try:
+    from lsst.afw.geom import getImageXY0FromMetadata, makeSkyWcs
+    from lsst.daf.base import PropertyList
+    from lsst.geom import Box2I, Extent2I
+
+    HAVE_AFW = True
+except ImportError:
+    HAVE_AFW = False
 
 
 def _make_header() -> astropy.io.fits.Header:
@@ -61,18 +67,46 @@ def _make_header() -> astropy.io.fits.Header:
 
 
 class FitsProjectionTestCase(unittest.TestCase):
-    """Tests for the FITS-header projection helper."""
+    """Tests for the FITS-header projection helper (no afw required)."""
 
     def setUp(self) -> None:
         self.header = _make_header()
         # (ny, nx) as returned by astropy ``hdu.shape``.
         self.shape = (64, 48)
 
-    def test_projection_matches_afw(self) -> None:
+    def test_bbox_origin_and_size(self) -> None:
+        _, bbox = projection_and_bbox_from_fits_header(self.header, self.shape)
+        self.assertIsInstance(bbox, Box)
+        # The "A" WCS has CRPIX*A = 1 and CRVAL*A = (100, 200), so grid (1, 1)
+        # maps to the parent origin (100, 200); the size comes from ``shape``.
+        self.assertEqual(bbox.x.start, 100)
+        self.assertEqual(bbox.y.start, 200)
+        self.assertEqual(bbox.x.size, self.shape[1])
+        self.assertEqual(bbox.y.size, self.shape[0])
+
+    def test_reference_pixel_maps_to_crval(self) -> None:
         projection, bbox = projection_and_bbox_from_fits_header(self.header, self.shape)
         self.assertIsInstance(projection, SkyProjection)
-        # The projection is in parent pixel coordinates, matching the legacy
-        # afw ``makeSkyWcs`` reference; sample a few parent pixels in the bbox.
+        # The projection is in parent pixel coordinates; the primary reference
+        # pixel CRPIX (1-based grid) sits at parent CRPIX - 1 + origin and must
+        # map to CRVAL.
+        ref_x = self.header["CRPIX1"] - 1 + bbox.x.start
+        ref_y = self.header["CRPIX2"] - 1 + bbox.y.start
+        sky = projection.pixel_to_sky(x=np.array([ref_x]), y=np.array([ref_y]))
+        self.assertAlmostEqual(float(sky.ra.deg[0]), self.header["CRVAL1"], places=6)
+        self.assertAlmostEqual(float(sky.dec.deg[0]), self.header["CRVAL2"], places=6)
+
+
+@unittest.skipUnless(HAVE_AFW, "lsst.afw/lsst.geom not available")
+class FitsProjectionAfwReferenceTestCase(unittest.TestCase):
+    """Cross-check the helper against the legacy afw implementation."""
+
+    def setUp(self) -> None:
+        self.header = _make_header()
+        self.shape = (64, 48)
+
+    def test_projection_matches_afw(self) -> None:
+        projection, bbox = projection_and_bbox_from_fits_header(self.header, self.shape)
         pl = PropertyList()
         pl.update(self.header)
         wcs = makeSkyWcs(pl)
@@ -86,7 +120,6 @@ class FitsProjectionTestCase(unittest.TestCase):
 
     def test_bbox_matches_afw_reference(self) -> None:
         _, bbox = projection_and_bbox_from_fits_header(self.header, self.shape)
-        self.assertIsInstance(bbox, Box)
         # afw reference for the parent bbox (XY0 from 'A' WCS + dimensions).
         pl = PropertyList()
         pl.update(self.header)

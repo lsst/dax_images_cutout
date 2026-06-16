@@ -28,16 +28,22 @@ import astropy.units as u
 import numpy as np
 
 import lsst.sphgeom
-from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.dax.images.cutout.stencils import (
     MaskBackend,
     SkyCircle,
     SkyStencil,
     _round_box_from_bounds,
 )
-from lsst.geom import Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
 from lsst.images import Box, GeneralFrame, Mask, MaskPlane, MaskSchema, SkyProjection
 from lsst.sphgeom import Angle, LonLat, UnitVector3d  # noqa: F401  (used by eval(repr))
+
+try:
+    from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
+    from lsst.geom import Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
+
+    HAVE_AFW = True
+except ImportError:
+    HAVE_AFW = False
 
 
 def _arcsec(value: float) -> Angle:
@@ -57,6 +63,7 @@ class ModuleHelpersTestCase(unittest.TestCase):
         self.assertEqual({b.name for b in MaskBackend}, {"AST", "SPHGEOM"})
 
 
+@unittest.skipUnless(HAVE_AFW, "lsst.afw/lsst.geom not available")
 class SkyCircleTestCase(unittest.TestCase):
     """Tests for `SkyCircle`."""
 
@@ -130,6 +137,7 @@ class SkyPolygonTestCase(unittest.TestCase):
         self.assertTrue(region.pointinregion([lonlat.getLon().asRadians(), lonlat.getLat().asRadians()]))
 
 
+@unittest.skipUnless(HAVE_AFW, "lsst.afw/lsst.geom not available")
 class BackendComparisonTestCase(unittest.TestCase):
     """Assert the AST and sphgeom backends agree on bbox and masked pixels."""
 

@@ -44,7 +44,6 @@ import starlink.Ast as Ast
 from astropy.coordinates import SkyCoord
 
 import lsst.sphgeom
-from lsst.daf.base import PropertyList
 from lsst.images import Box, Mask, NoOverlapError, SkyProjection
 from lsst.images.utils import round_half_down, round_half_up
 from lsst.sphgeom import Angle, LonLat, UnitVector3d
@@ -307,7 +306,7 @@ class SkyStencil(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def to_fits_metadata(self, metadata: PropertyList | MutableMapping[str, Any]) -> None:
+    def to_fits_metadata(self, metadata: MutableMapping[str, Any]) -> None:
         """Write FITS header entries that describe the stencil."""
         raise NotImplementedError()
 
@@ -426,7 +425,7 @@ class SkyCircle(SkyStencil):
         # Docstring inherited.
         return lsst.sphgeom.Circle(UnitVector3d(self._center), self._radius)
 
-    def to_fits_metadata(self, metadata: PropertyList | MutableMapping[str, Any]) -> None:
+    def to_fits_metadata(self, metadata: MutableMapping[str, Any]) -> None:
         # Docstring inherited.
         metadata["ST_TYPE"] = "CIRCLE"
         metadata["ST_RA"] = self._center.getLon().asDegrees()
@@ -517,7 +516,7 @@ class SkyPolygon(SkyStencil):
         # Docstring inherited.
         return lsst.sphgeom.ConvexPolygon([UnitVector3d(v) for v in self._vertices])
 
-    def to_fits_metadata(self, metadata: PropertyList | MutableMapping[str, Any]) -> None:
+    def to_fits_metadata(self, metadata: MutableMapping[str, Any]) -> None:
         # Docstring inherited.
         metadata["ST_TYPE"] = "POLYGON"
         if len(self._vertices) > 100:
