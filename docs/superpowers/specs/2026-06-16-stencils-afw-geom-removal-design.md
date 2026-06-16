@@ -44,7 +44,7 @@ They are converted to `lsst.images` types at three seams, all outside `stencils.
 | `SkyWcs` (butler `wcs` component) | `ReadComponents` | `SkyProjection.from_legacy(wcs, GeneralFrame(unit=u.pix))` | `projection_finders.py` |
 | `SkyWcs` (skymap) | `UseSkyMap` | `SkyProjection.from_legacy(...)` | `projection_finders.py` |
 | `Box2I` (butler/skymap) | `ReadComponents`, `UseSkyMap` | `Box.from_legacy(bbox)` | `projection_finders.py` |
-| FITS header WCS | `ReadComponentsAstropyFits`, astropy cutout branches | `SkyProjection` via `starlink.Ast` (see below) | shared FITS helper |
+| FITS header WCS | `ReadComponentsAstropyFits`, astropy cutout branches | `SkyProjection` via the `lsst.images` AST wrapper (see below) | shared FITS helper |
 | afw `Mask` plane | legacy `Extraction.mask` | empty `lsst.images.Mask`, result copied back | `_image_cutout.py` |
 
 ## `stencils.py` changes
@@ -88,17 +88,45 @@ A new private module (working name `_fits_projection.py`) exposes:
 projection_and_bbox_from_fits_header(header, shape) -> tuple[SkyProjection, Box]
 ```
 
-1. Load the header cards into a `starlink.Ast.FitsChan` and `read()` the single resulting `FrameSet`.
-   For LSST FITS data this FrameSet has a base `GRID` frame (pixel coordinates), a current `SKY` frame (the primary celestial WCS), and a third frame identified by `Ident == "A"` (the alternate WCS that encodes the parent origin).
-2. Convert the starlink `FrameSet` to whatever AST wrapper `lsst.images` uses.
-   When `lsst.images` is built against astshim, serialize the starlink `FrameSet` with a sink-based `Ast.Channel` and re-read it through an `astshim.Channel`.
-   When astshim is absent, `lsst.images` uses native starlink-pyast and `SkyProjection.from_ast_frame_set` accepts the starlink `FrameSet` directly, so the serialization step is skipped.
-   The helper selects the path by attempting to import astshim.
-3. Build the projection with `SkyProjection.from_ast_frame_set(frame_set, GeneralFrame(unit=u.pix))`.
-4. Derive the parent origin (XY0) by applying the `GRID -> "A"` mapping to the grid origin, and build `full_bbox` as an `lsst.images.Box` from XY0 and `shape`.
-   The exact integer convention (1-based AST `GRID` versus 0-based `lsst.images` pixels) is validated during implementation against the current `getImageXY0FromMetadata(pl, "A")` result, which is the reference; no heuristic offset is introduced.
+The helper is written entirely against the AST wrapper that `lsst.images` already
+provides in `lsst.images._transforms._ast`, so that all astshim-versus-starlink
+detection and conversion is handled inside `lsst.images` and never appears in this
+package.
+That wrapper re-exports astshim when it is installed and otherwise supplies
+starlink-pyast-backed shims with the same (astshim-style) interface, exposing a
+`USING_STARLINK_PYAST` flag and `FitsChan`/`FrameSet`/`StringStream`/`Channel`
+types.
+`SkyProjection.from_ast_frame_set` consumes a wrapper `FrameSet` directly, so a
+`FrameSet` produced by the wrapper's `FitsChan` needs no bridging regardless of
+backend.
 
-This helper is the single home for FITS-WCS parsing and is used by both `projection_finders.ReadComponentsAstropyFits` and the astropy branches of `_image_cutout.py`.
+1. Feed the header into the wrapper's `StringStream` (it accepts the single
+   concatenated block from `astropy.io.fits.Header.tostring()`) and read it with
+   the wrapper's `FitsChan`, taking the single resulting `FrameSet`.
+   For LSST FITS data this FrameSet has a base `GRID` frame (pixel coordinates), a
+   current `SKY` frame (the primary celestial WCS), and a third frame whose
+   identifier is `"A"` (the alternate WCS that encodes the parent origin).
+2. Build the projection with
+   `SkyProjection.from_ast_frame_set(frame_set, GeneralFrame(unit=u.pix))`.
+3. Derive the parent origin (XY0) by locating the frame with identifier `"A"`,
+   applying the `GRID -> "A"` mapping to the grid origin, and build
+   `full_bbox` as an `lsst.images.Box` from XY0 and `shape`.
+   The exact integer convention (1-based AST `GRID` versus 0-based `lsst.images`
+   pixels) is validated during implementation against the current
+   `getImageXY0FromMetadata(pl, "A")` result, which is the reference; no heuristic
+   offset is introduced.
+
+This helper is the single home for FITS-WCS parsing and is used by both
+`projection_finders.ReadComponentsAstropyFits` and the astropy branches of
+`_image_cutout.py`.
+
+Because the helper depends only on `lsst.images` (its public `SkyProjection`/`Box`
+APIs plus the `_transforms._ast` wrapper) and astropy, it is deliberately shaped so
+it can be lifted into `lsst.images` later — for example as a
+`SkyProjection.from_fits_header` constructor — by moving the file and changing the
+wrapper import from `lsst.images._transforms._ast` to a package-relative one.
+The dependency on the currently-private `_transforms._ast` module is accepted as an
+interim coupling for exactly this reason.
 
 ## `projection_finders.py` changes
 
@@ -127,6 +155,6 @@ This helper is the single home for FITS-WCS parsing and is used by both `project
 
 ## Risks and validated facts
 
-- Validated in this environment: `lsst.images.Mask.set`/`get` round-trip a boolean plane; `SkyProjection.from_ast_frame_set` accepts an astshim `FrameSet`; `sphgeom` `LonLat`/`UnitVector3d`/`Circle`/`Angle` and astropy `directional_offset_by` behave as needed; a single `starlink.Ast.FitsChan.read()` yields one `FrameSet` with `GRID`/`SKY`/`A` frames; the starlink->astshim native-text bridge feeds `from_ast_frame_set` and reproduces `CRPIX -> CRVAL`; the `GRID -> "A"` mapping reproduces `CRVAL*A` at the reference pixel.
+- Validated in this environment (with astshim present, `USING_STARLINK_PYAST` false): `lsst.images.Mask.set`/`get` round-trip a boolean plane; `sphgeom` `LonLat`/`UnitVector3d`/`Circle`/`Angle` and astropy `directional_offset_by` behave as needed; the wrapper's `FitsChan.read()` (fed from `Header.tostring()` via the wrapper `StringStream`) yields one `FrameSet` with `GRID`/`SKY`/`A` frames; `SkyProjection.from_ast_frame_set` consumes that wrapper `FrameSet` and reproduces `CRPIX -> CRVAL`; the `GRID -> "A"` mapping reproduces `CRVAL*A` at the reference pixel.
 - The XY0 integer convention must match `getImageXY0FromMetadata` exactly; this is checked against that function during implementation rather than approximated.
-- The astshim-absent path (native starlink `FrameSet` accepted directly) cannot be exercised where astshim is installed; the wrapper-selection branch is covered by reasoning plus the documented `lsst.images` duality and should be confirmed in an astshim-free environment.
+- The starlink-pyast wrapper path (`USING_STARLINK_PYAST` true) cannot be exercised where astshim is installed.  The helper uses only the wrapper interface, which is identical across backends, so correctness there rests on the wrapper's own guarantee; it should still be confirmed once in an astshim-free environment.
