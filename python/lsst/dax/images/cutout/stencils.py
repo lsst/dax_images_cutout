@@ -41,11 +41,13 @@ import numpy as np
 import lsst.afw.detection
 import lsst.afw.geom.ellipses
 import lsst.afw.geom.polygon
+import lsst.images
 import lsst.sphgeom
 from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
 from lsst.daf.base import PropertyList
 from lsst.geom import Angle, Box2D, Box2I, Point2D, SpherePoint, radians
+from lsst.images import SkyProjection
 
 
 class StencilNotContainedError(RuntimeError):
@@ -131,7 +133,7 @@ class SkyStencil(ABC):
     """An image cutout stencil defined in sky (ICRS) coordinates."""
 
     @abstractmethod
-    def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
+    def to_pixels(self, wcs: SkyWcs | SkyProjection, bbox: Box2I | lsst.images.Box) -> PixelStencil:
         """Transform to a pixel-coordinate set of spans.
 
         Parameters
@@ -277,11 +279,22 @@ class SkyCircle(SkyStencil):
             (self._center.offset(b * factor, self._radius) for b in range(n_vertices)), clip=self._clip
         )
 
-    def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
+    def to_pixels(self, wcs: SkyWcs | SkyProjection, bbox: Box2I | lsst.images.Box) -> PixelStencil:
         # Docstring inherited.
+        if isinstance(wcs, SkyProjection):
+            # Eventually we want to reverse the logic so that the code is
+            # using the modern APIs and the legacy mode is the fallback.
+            wcs = wcs.to_legacy()
+        assert isinstance(wcs, SkyWcs)
+
+        if isinstance(bbox, lsst.images.Box):
+            bbox = bbox.to_legacy()
+        assert isinstance(bbox, Box2I)
+
         # convert to a polygon with ~arcsecond vertices
         circumference = 2 * np.pi * np.sin(self._radius.asRadians()) * radians
         n_vertices = min(max(16, int(np.round(circumference.asArcseconds()))), self.MAX_POLYGON_VERTICES)
+        print(self.to_polygon(n_vertices).to_pixels(wcs, bbox))
         return self.to_polygon(n_vertices).to_pixels(wcs, bbox)
 
     @property
@@ -291,10 +304,10 @@ class SkyCircle(SkyStencil):
 
     def to_fits_metadata(self, metadata: PropertyList) -> None:
         # Docstring inherited.
-        metadata.set("ST_TYPE", "CIRCLE", "Type of stencil used to create this cutout.")
-        metadata.set("ST_RA", self._center.getRa().asDegrees(), "Circle center right ascension in degrees.")
-        metadata.set("ST_DEC", self._center.getDec().asDegrees(), "Circle center declination in degrees.")
-        metadata.set("ST_RAD", self._radius.asDegrees(), "Circle radius in degrees.")
+        metadata["ST_TYPE"] = "CIRCLE"
+        metadata["ST_RA"] = self._center.getRa().asDegrees()
+        metadata["ST_DEC"] = self._center.getDec().asDegrees()
+        metadata["ST_RAD"] = self._radius.asDegrees()
 
     @property
     def fingerprint(self) -> bytes:
@@ -351,8 +364,18 @@ class SkyPolygon(SkyStencil):
         """
         return cls((_spherepoint_from_astropy(v) for v in vertices), clip=clip)
 
-    def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
+    def to_pixels(self, wcs: SkyWcs | SkyProjection, bbox: Box2I | lsst.images.Box) -> PixelStencil:
         # Docstring inherited.
+        if isinstance(wcs, SkyProjection):
+            # Eventually we want to reverse the logic so that the code is
+            # using the modern APIs and the legacy mode is the fallback.
+            wcs = wcs.to_legacy()
+        assert isinstance(wcs, SkyWcs)
+
+        if isinstance(bbox, lsst.images.Box):
+            bbox = bbox.to_legacy()
+        assert isinstance(bbox, Box2I)
+
         pixel_vertices = wcs.skyToPixel(self._vertices)
         pixel_vertices.append(pixel_vertices[0])  # afw.polygon expects to be explicitly closed
         # Input sky coordinates should be CCW looking out, and afw.polygon
@@ -381,14 +404,14 @@ class SkyPolygon(SkyStencil):
 
     def to_fits_metadata(self, metadata: PropertyList) -> None:
         # Docstring inherited.
-        metadata.set("ST_TYPE", "POLYGON", "Type of stencil used to create this cutout.")
+        metadata["ST_TYPE"] = "POLYGON"
         if len(self._vertices) > 100:
             raise NotImplementedError(
                 "TODO: FITS limitations make it difficult to serialize big stencils to the header."
             )
         for n, v in enumerate(self._vertices):
-            metadata.set(f"ST_RA{n:02d}", v.getRa().asDegrees(), f"Vertex {n} right ascension in degrees.")
-            metadata.set(f"ST_DEC{n:02d}", v.getDec().asDegrees(), f"Vertex {n} declination in degrees.")
+            metadata[f"ST_RA{n:02d}"] = v.getRa().asDegrees()
+            metadata[f"ST_DEC{n:02d}"] = v.getDec().asDegrees()
 
     @property
     def fingerprint(self) -> bytes:
