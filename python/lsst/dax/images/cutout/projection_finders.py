@@ -38,14 +38,17 @@ from collections.abc import Iterable
 from typing import cast
 
 import astropy.io.fits
+import astropy.units as u
 
-import lsst.geom
-from lsst.afw.geom import SkyWcs, getImageXY0FromMetadata, makeSkyWcs
-from lsst.daf.base import PropertyList
 from lsst.daf.butler import Butler, DatasetRef
-from lsst.geom import Box2I
+from lsst.images import Box, GeneralFrame, SkyProjection
 from lsst.skymap import BaseSkyMap
 from lsst.utils.timer import time_this
+
+from ._fits_projection import projection_and_bbox_from_fits_header
+
+# Pixel coordinate frame for projections built from afw SkyWcs objects.
+_PIXEL_FRAME = GeneralFrame(unit=u.pix)
 
 _LOG = logging.getLogger(__name__)
 _TIMER_LOG_LEVEL = logging.INFO
@@ -68,7 +71,7 @@ class ProjectionFinder(ABC):
     @abstractmethod
     def find_projection(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I] | None:
+    ) -> tuple[SkyProjection, Box] | None:
         """Run the finder on the given dataset with the given butler.
 
         Parameters
@@ -84,9 +87,9 @@ class ProjectionFinder(ABC):
 
         Returns
         -------
-        wcs : `SkyWcs` (only if result is not `None`)
+        projection : `lsst.images.SkyProjection` (only if result is not `None`)
             Mapping from sky to pixel coordinates for this dataset.
-        bbox : `Box2I` (only if result is not `None`)
+        bbox : `lsst.images.Box` (only if result is not `None`)
             Bounding box of the image dataset (or an image closely associated
             with the dataset) in pixel coordinates.
         """
@@ -94,7 +97,7 @@ class ProjectionFinder(ABC):
 
     def __call__(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I]:
+    ) -> tuple[SkyProjection, Box]:
         """Call `find_projection` but raise `LookupError` when no projection
         information is found.
 
@@ -111,9 +114,9 @@ class ProjectionFinder(ABC):
 
         Returns
         -------
-        wcs : `SkyWcs`
+        projection : `lsst.images.SkyProjection`
             Mapping from sky to pixel coordinates for this dataset.
-        bbox : `Box2I`
+        bbox : `lsst.images.Box`
             Bounding box of the image dataset (or an image closely associated
             with the dataset) in pixel coordinates.
         """
@@ -156,14 +159,14 @@ class ReadComponents(ProjectionFinder):
 
     def find_projection(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I] | None:
+    ) -> tuple[SkyProjection, Box] | None:
         # Docstring inherited.
         if {"wcs", "bbox"}.issubset(ref.datasetType.storageClass.allComponents().keys()):
             logger = logger if logger is not None else _LOG
             with time_this(_LOG, msg="Read projection info from butler components", level=_TIMER_LOG_LEVEL):
                 wcs = butler.get(ref.makeComponentRef("wcs"))
                 bbox = butler.get(ref.makeComponentRef("bbox"))
-                return wcs, bbox
+                return SkyProjection.from_legacy(wcs, _PIXEL_FRAME), Box.from_legacy(bbox)
         return None
 
 
@@ -180,7 +183,7 @@ class ReadComponentsAstropyFits(ProjectionFinder):
 
     def find_projection(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I] | None:
+    ) -> tuple[SkyProjection, Box] | None:
         # Docstring inherited.
         logger = logger if logger is not None else _LOG
         with time_this(logger, msg="Read projection info using Astropy", level=_TIMER_LOG_LEVEL):
@@ -201,15 +204,7 @@ class ReadComponentsAstropyFits(ProjectionFinder):
                             hdr = hdu.header
                             extname = hdr.get("EXTNAME")
                             if extname and extname.lower() in pixel_components:
-                                shape = hdu.shape
-                                dimensions = lsst.geom.Extent2I(shape[1], shape[0])
-                                pl = PropertyList()
-                                pl.update(hdr)
-                                # XY0 is defined in the A WCS.
-                                xy0 = getImageXY0FromMetadata(pl, "A", strip=False)
-                                bbox = lsst.geom.Box2I(xy0, dimensions)
-                                wcs = makeSkyWcs(pl)
-                                return wcs, bbox
+                                return projection_and_bbox_from_fits_header(hdr, hdu.shape)
                 except Exception:
                     # Any failure and we will try the next option.
                     pass
@@ -237,7 +232,7 @@ class TryComponentParents(ProjectionFinder):
 
     def find_projection(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I] | None:
+    ) -> tuple[SkyProjection, Box] | None:
         # Docstring inherited.
         while True:
             if (result := self._nested.find_projection(ref, butler, logger=logger)) is not None:
@@ -278,7 +273,7 @@ class UseSkyMap(ProjectionFinder):
 
     def find_projection(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I] | None:
+    ) -> tuple[SkyProjection, Box] | None:
         # Docstring inherited.
         if "tract" in ref.dataId.dimensions:
             assert "skymap" in ref.dataId.dimensions, "Guaranteed by expected dimension schema."
@@ -289,9 +284,15 @@ class UseSkyMap(ProjectionFinder):
             tractInfo = skymap[ref.dataId["tract"]]
             if "patch" in ref.dataId.dimensions:
                 patchInfo = tractInfo[ref.dataId["patch"]]
-                return patchInfo.wcs, patchInfo.outer_bbox
+                return (
+                    SkyProjection.from_legacy(patchInfo.wcs, _PIXEL_FRAME),
+                    Box.from_legacy(patchInfo.outer_bbox),
+                )
             else:
-                return tractInfo.wcs, tractInfo.bbox
+                return (
+                    SkyProjection.from_legacy(tractInfo.wcs, _PIXEL_FRAME),
+                    Box.from_legacy(tractInfo.bbox),
+                )
         return None
 
 
@@ -310,7 +311,7 @@ class Chain(ProjectionFinder):
 
     def find_projection(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I] | None:
+    ) -> tuple[SkyProjection, Box] | None:
         # Docstring inherited.
         for f in self._nested:
             if (result := f.find_projection(ref, butler, logger=logger)) is not None:
@@ -346,7 +347,7 @@ class MatchDatasetTypeName(ProjectionFinder):
 
     def find_projection(
         self, ref: DatasetRef, butler: Butler, logger: logging.Logger | None = None
-    ) -> tuple[SkyWcs, Box2I] | None:
+    ) -> tuple[SkyProjection, Box] | None:
         # Docstring inherited.
         if self._regex.match(ref.datasetType.name):
             if self._on_match is not None:
