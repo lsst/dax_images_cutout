@@ -30,8 +30,50 @@ import numpy as np
 import lsst.sphgeom
 from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
 from lsst.afw.image import Mask
-from lsst.dax.images.cutout.stencils import SkyCircle, SkyStencil
+from lsst.dax.images.cutout.stencils import (
+    _PIXEL_FRAME,
+    MaskBackend,
+    SkyCircle,
+    SkyStencil,
+    _as_box,
+    _as_projection,
+    _round_box_from_bounds,
+)
 from lsst.geom import Angle, Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
+from lsst.images import Box, SkyProjection
+
+
+class BoundaryHelpersTestCase(unittest.TestCase):
+    """Tests for the afw->lsst.images boundary normalization helpers."""
+
+    def setUp(self) -> None:
+        self.center = SpherePoint(12.0, 13.0, degrees)
+        self.wcs = makeSkyWcs(Point2D(5.0, 7.0), self.center, makeCdMatrix(0.1 * arcseconds))
+        self.box2i = Box2I(Point2I(-16, -13), Point2I(26, 27))
+
+    def test_as_projection_passthrough(self) -> None:
+        projection = SkyProjection.from_legacy(self.wcs, _PIXEL_FRAME)
+        self.assertIs(_as_projection(projection), projection)
+
+    def test_as_projection_from_skywcs(self) -> None:
+        projection = _as_projection(self.wcs)
+        self.assertIsInstance(projection, SkyProjection)
+
+    def test_as_box_passthrough(self) -> None:
+        box = Box.from_legacy(self.box2i)
+        self.assertIs(_as_box(box), box)
+
+    def test_as_box_from_box2i(self) -> None:
+        box = _as_box(self.box2i)
+        self.assertEqual(box, Box.from_legacy(self.box2i))
+
+    def test_round_box_from_bounds(self) -> None:
+        # x in [4.6, 9.4], y in [2.6, 5.4] -> box [3:6, 5:10] in [y, x].
+        box = _round_box_from_bounds(4.6, 9.4, 2.6, 5.4)
+        self.assertEqual(box, Box.factory[3:6, 5:10])
+
+    def test_mask_backend_members(self) -> None:
+        self.assertEqual({b.name for b in MaskBackend}, {"AST", "SPHGEOM"})
 
 
 class SkyCircleTestCase(unittest.TestCase):
@@ -73,10 +115,10 @@ class SkyCircleTestCase(unittest.TestCase):
         # Make it slightly bigger in x to catch x<->y transposition bugs.
         bbox = Box2I(Point2I(-16, -13), Point2I(26, 27))
         # Check to_pixel(...).set_mask(...) against a brute-force
-        # implementation.  The max_missing threshold (and implicitly, the
-        # max_extra=0 threshold) was set after inspection with plot=True to
-        # prevent accidental regressions.
-        _check_to_pixel(self, self.instance, wcs, bbox, max_missing=12)
+        # implementation.  The AST backend masks the true sky circle, so it
+        # matches the brute force exactly here; the small margin guards against
+        # round-off between the astshim and starlink-pyast mapping evaluations.
+        _check_to_pixel(self, self.instance, wcs, bbox, backend=MaskBackend.AST, max_missing=2, max_extra=2)
 
     def test_to_polygon(self) -> None:
         """Test conversion to a `SkyPolygon`.
@@ -97,10 +139,85 @@ class SkyCircleTestCase(unittest.TestCase):
         self.assertNotEqual(
             self.instance.region.relate(polygon_stencil.region.getBoundingCircle()), lsst.sphgeom.DISJOINT
         )
-        # Check the polygon's to_pixel implementation.  The max_missing
-        # threshold (and implicitly, the max_extra=0 threshold) was set after
-        # inspection with plot=True to prevent accidental regressions.
-        _check_to_pixel(self, polygon_stencil, wcs, bbox, max_missing=4)
+        # Check the polygon's to_pixel implementation.  The AST and sphgeom
+        # great-circle polygons agree to within a few boundary pixels; these
+        # thresholds were set after inspection to prevent regressions.
+        _check_to_pixel(self, polygon_stencil, wcs, bbox, backend=MaskBackend.AST, max_missing=6, max_extra=6)
+
+    def test_ast_sky_region_circle_contains_center(self) -> None:
+        """The AST sky region must contain its own center."""
+        region = self.instance._ast_sky_region()
+        self.assertTrue(
+            region.pointinregion([self.center.getRa().asRadians(), self.center.getDec().asRadians()])
+        )
+
+    def test_to_pixel_sphgeom(self) -> None:
+        """The sphgeom backend reproduces the brute-force reference exactly."""
+        wcs = makeSkyWcs(Point2D(5.0, 7.0), self.center, makeCdMatrix(0.1 * arcseconds))
+        bbox = Box2I(Point2I(-16, -13), Point2I(26, 27))
+        _check_to_pixel(
+            self, self.instance, wcs, bbox, backend=MaskBackend.SPHGEOM, max_missing=0, max_extra=0
+        )
+
+    def test_to_pixel_sphgeom_polygon(self) -> None:
+        """Reproduce the brute-force reference for a polygon (sphgeom)."""
+        wcs = makeSkyWcs(Point2D(5.0, 7.0), self.center, makeCdMatrix(0.1 * arcseconds))
+        bbox = Box2I(Point2I(-16, -13), Point2I(26, 27))
+        polygon_stencil = self.instance.to_polygon()
+        _check_to_pixel(
+            self, polygon_stencil, wcs, bbox, backend=MaskBackend.SPHGEOM, max_missing=0, max_extra=0
+        )
+
+
+class SkyPolygonTestCase(unittest.TestCase):
+    """Tests for `SkyPolygon` orientation handling."""
+
+    def setUp(self) -> None:
+        center = SpherePoint(12.0, 13.0, degrees)
+        self.instance = SkyCircle(center, Angle(2.0, arcseconds)).to_polygon(n_vertices=8)
+        self.center = center
+
+    def test_ast_sky_region_polygon_contains_centroid(self) -> None:
+        """AST polygon selects the bounded interior, not the complement."""
+        region = self.instance._ast_sky_region()
+        centroid = self.instance.region.getCentroid()
+        lonlat = lsst.sphgeom.LonLat(centroid)
+        self.assertTrue(region.pointinregion([lonlat.getLon().asRadians(), lonlat.getLat().asRadians()]))
+
+
+class BackendComparisonTestCase(unittest.TestCase):
+    """Assert the AST and sphgeom backends agree on bbox and masked pixels."""
+
+    def setUp(self) -> None:
+        self.center = SpherePoint(12.0, 13.0, degrees)
+        self.wcs = makeSkyWcs(Point2D(5.0, 7.0), self.center, makeCdMatrix(0.1 * arcseconds))
+        self.bbox = Box2I(Point2I(-16, -13), Point2I(26, 27))
+
+    def _masked_array(self, stencil: SkyStencil, backend: MaskBackend) -> tuple[np.ndarray, Box]:
+        pixel_stencil = stencil.to_pixels(self.wcs, self.bbox, backend=backend)
+        mask = Mask(self.bbox)
+        mask.addMaskPlane("STENCIL")
+        bits = mask.getPlaneBitMask("STENCIL")
+        pixel_stencil.set_mask(mask, bits)
+        return (mask.array & bits).astype(bool), pixel_stencil.bbox
+
+    def test_backends_agree_circle(self) -> None:
+        circle = SkyCircle(self.center, Angle(1.0, arcseconds))
+        ast_mask, ast_box = self._masked_array(circle, MaskBackend.AST)
+        sph_mask, sph_box = self._masked_array(circle, MaskBackend.SPHGEOM)
+        # Both backends size the box from the same sky boundary sample.
+        self.assertEqual(ast_box, sph_box)
+        # The true sky circle is masked identically by both backends.
+        self.assertEqual(int(np.sum(ast_mask != sph_mask)), 0)
+
+    def test_backends_agree_polygon(self) -> None:
+        polygon = SkyCircle(self.center, Angle(1.0, arcseconds)).to_polygon()
+        ast_mask, ast_box = self._masked_array(polygon, MaskBackend.AST)
+        sph_mask, sph_box = self._masked_array(polygon, MaskBackend.SPHGEOM)
+        self.assertEqual(ast_box, sph_box)
+        # The AST great-circle polygon and the sphgeom ConvexPolygon classify a
+        # few boundary pixels differently; the difference is small and stable.
+        self.assertLessEqual(int(np.sum(ast_mask != sph_mask)), 12)
 
 
 def _brute_force_stencil_array(sky_stencil: SkyStencil, wcs: SkyWcs, bbox: Box2I) -> np.ndarray:
@@ -148,6 +265,7 @@ def _check_to_pixel(
     wcs: SkyWcs,
     bbox: Box2I,
     *,
+    backend: MaskBackend = MaskBackend.AST,
     max_missing: int = 0,
     max_extra: int = 0,
     plot: bool = False,
@@ -178,8 +296,8 @@ def _check_to_pixel(
         except when debugging or actively developing a new test, and even then
         it probably requires that the test not be run by pytest.
     """
-    pixel_stencil = sky_stencil.to_pixels(wcs, bbox)
-    test_case.assertTrue(bbox.contains(pixel_stencil.bbox))
+    pixel_stencil = sky_stencil.to_pixels(wcs, bbox, backend=backend)
+    test_case.assertTrue(bbox.contains(pixel_stencil.bbox.to_legacy()))
     mask = Mask(bbox)
     mask.addMaskPlane("STENCIL")
     bits = mask.getPlaneBitMask("STENCIL")
