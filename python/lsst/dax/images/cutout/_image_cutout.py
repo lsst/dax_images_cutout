@@ -400,16 +400,16 @@ class ImageCutoutFactory:
         ):
             match cutout_mode:
                 case CutoutMode.FULL_EXPOSURE:
-                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
+                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox.to_legacy()})
                     timesys = cutout.metadata.get("TIMESYS", timesys)
                 case CutoutMode.STRIPPED_EXPOSURE:
-                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
+                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox.to_legacy()})
                     metadata = cutout.metadata  # Track metadata externally.
                     timesys = metadata.get("TIMESYS", timesys)
                     cutout = makeExposure(cutout.maskedImage, wcs=cutout.wcs)
                 case CutoutMode.IMAGE_ONLY:
                     cutout = self.butler.get(
-                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     # No metadata so UTC is default.
                     timesys = "UTC"
@@ -417,13 +417,13 @@ class ImageCutoutFactory:
                     # Rely on the file being cached on first read. Faster than
                     # reading entire exposure.
                     image = self.butler.get(
-                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     variance = self.butler.get(
-                        ref.makeComponentRef("variance"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("variance"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     mask = self.butler.get(
-                        ref.makeComponentRef("mask"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("mask"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     wcs = self.butler.get(ref.makeComponentRef("wcs"))
                     masked_image = makeMaskedImage(image, mask, variance)
@@ -474,7 +474,7 @@ class ImageCutoutFactory:
                                     # Use FITS WCS.
                                     wcs = makeSkyWcs(pl)
                                     pixel_stencil = stencil.to_pixels(wcs, full_bbox)
-                                    bbox = pixel_stencil.bbox
+                                    bbox = pixel_stencil.bbox.to_legacy()
 
                                 # Work out the required cutout of the HDU.
                                 minX = bbox.getBeginX() - full_bbox.getBeginX()
@@ -596,7 +596,7 @@ class ImageCutoutFactory:
 
                     # Transform the stencil to pixel coordinates.
                     pixel_stencil = stencil.to_pixels(sky_projection, bbox)
-                    modern_bbox = lsst.images.Box.from_legacy(pixel_stencil.bbox)
+                    modern_bbox = pixel_stencil.bbox
 
                     match cutout_mode:
                         case CutoutMode.FULL_EXPOSURE:
@@ -680,7 +680,7 @@ class ImageCutoutFactory:
                                 # Use FITS WCS.
                                 wcs = makeSkyWcs(pl)
                                 pixel_stencil = stencil.to_pixels(wcs, full_bbox)
-                                bbox = pixel_stencil.bbox
+                                bbox = pixel_stencil.bbox.to_legacy()
 
                             # Work out the required cutout of the HDU.
                             minX = bbox.getBeginX() - full_bbox.getBeginX()
