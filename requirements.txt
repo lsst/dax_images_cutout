@@ -4,5 +4,5 @@ starlink-pyast >= 4.0.1
 numpy
 astropy
 lsst-sphgeom
-lsst-resources
+lsst-resources[https]
 lsst-utils
