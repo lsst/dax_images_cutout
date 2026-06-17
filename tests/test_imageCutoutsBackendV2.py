@@ -99,6 +99,29 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
                     output = cutoutBackend.process_uuid(self.stencil, dataRef.id, cutout_mode=cutout_mode)
                     self.assertTrue(output.exists())
 
+    def test_provenance_in_primary_header(self):
+        """Cutout provenance must land in the primary FITS header for every
+        cutout mode, including the native ``lsst.images`` container modes.
+        """
+        dataRef = self.butler.registry.findDataset("deep_coadd", dataId=self.dataId)
+        provenance_keys = ("BTLRUUID", "BTLRNAME", "DATE-CUT", "CUTVERS")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinders[0], tempdir)
+            for cutout_mode in CutoutMode:
+                with self.subTest(cutout_mode=cutout_mode):
+                    output = cutoutBackend.process_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
+                    with output.open("rb") as fh, astropy.io.fits.open(fh) as hdul:
+                        header = hdul[0].header
+                    for key in provenance_keys:
+                        self.assertIn(
+                            key,
+                            header,
+                            f"{key} missing from primary header for {cutout_mode}",
+                        )
+                    self.assertEqual(header["BTLRUUID"], dataRef.id.hex)
+                    self.assertEqual(header["BTLRNAME"], dataRef.datasetType.name)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -173,8 +173,11 @@ class Extraction:
         logger = logger if logger is not None else _LOG
         with time_this(logger, msg="Writing FITS file to %s", args=(path,), level=_TIMER_LOG_LEVEL):
             if isinstance(self.cutout, lsst.images.GeneralizedImage):
-                self.cutout.metadata.update(self.metadata)  # Or store in opaque metadata.
-                self.cutout.write(path)
+                # Write the cutout provenance into the primary FITS header via
+                # the archive's update_header hook.  Storing it in the object's
+                # flexible metadata would instead place it in the JSON tree,
+                # where it would not appear in the primary header.
+                self.cutout.write(path, update_header=lambda header: header.update(self.metadata))
             elif hasattr(self.cutout, "getMetadata") and hasattr(self.cutout, "writeFits"):
                 self.cutout.metadata.update(self.metadata)
                 self.cutout.writeFits(path)
