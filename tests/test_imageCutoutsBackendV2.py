@@ -27,6 +27,7 @@ import astropy.io.fits
 import astropy.units as u
 
 import lsst.images
+import lsst.images.serialization
 import lsst.sphgeom
 import lsst.utils.tests
 from lsst.daf.butler import Butler
@@ -48,69 +49,107 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
         radius = lsst.sphgeom.Angle((3 * u.arcsec).to_value(u.rad))
         self.stencil = stencils.SkyCircle(point, radius)
 
+        # Projection finders are irrelevant in V2 but the constructor
+        # still requires at least one.
         self.projectionFinders = (
             projection_finders.ReadComponents(),
             projection_finders.ReadComponentsAstropyFits(),
         )
 
         self.dataId = {"patch": 76, "tract": 5428, "band": "g", "skymap": "lsst_cells_v2"}
+        ref = self.butler.find_dataset("deep_coadd", data_id=self.dataId)
+        assert ref is not None
+        self.ref = ref
 
     def test_extract_ref(self):
-        """Test that extract_ref produces a reasonable cutout."""
-        dataRef = self.butler.registry.findDataset("deep_coadd", dataId=self.dataId)
+        """Test that extract_ref produces a reasonable cutout for all modes."""
+        for cutout_mode in CutoutMode:
+            # Projection finder has no effect for V2 and tempdir is
+            # not relevant for this test.
+            proj_finder = self.projectionFinders[0]
+            cutoutBackend = ImageCutoutFactory(self.butler, proj_finder, ".")
+            result = cutoutBackend.extract_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
+            match result.cutout:
+                case lsst.images.MaskedImage():
+                    box = result.cutout.bbox
+                    array = result.cutout.image.array
+                case lsst.images.Image():
+                    array = result.cutout.array
+                    box = result.cutout.bbox
+                case astropy.io.fits.HDUList():
+                    hdu = result.cutout[1]
+                    array = hdu.data
+                    # Only checks the shape.
+                    box = lsst.images.Box.factory[1 : hdu.shape[0] + 1, 1 : hdu.shape[1] + 1]
+                case _:
+                    raise RuntimeError(f"Unexpected cutout type: {type(result.cutout)}")
 
+            with self.subTest(cutout_mode=cutout_mode):
+                self.assertEqual(box.x.size, 29)
+                self.assertEqual(box.y.size, 28)
+
+                # We are reading these values from the fuzzed data that
+                # has no scientific content but we can test that each
+                # cutout is returning the same value. These numbers have
+                # not been validated by external tooling and will change
+                # on redoing the fuzzing.
+                self.assertFloatsAlmostEqual(array[14, 15], 2.788926362991333)
+                self.assertFloatsAlmostEqual(array[1, 1], 7.183607578277588)
+                self.assertFloatsAlmostEqual(array[27, 28], -11.042882919311523)
+
+    def test_off_edge_cutout(self) -> None:
+        """Test that we get a truncated cutout at the edge of the image."""
+        # Shift the default position slightly so we fall partly off the edge.
+        # Shift Y such that the bounding box is [-17:12] vs [0:64]
+        point = lsst.sphgeom.LonLat.fromDegrees(0.25708, -3.03894)
+        radius = lsst.sphgeom.Angle((3 * u.arcsec).to_value(u.rad))
+        self.stencil = stencils.SkyCircle(point, radius, clip=True)
+
+        proj_finder = self.projectionFinders[0]
+        # Should not write any file out so tempdir is irrelevant.
+        cutoutBackend = ImageCutoutFactory(self.butler, proj_finder, ".")
+        result = cutoutBackend.extract_ref(self.stencil, self.ref, cutout_mode=CutoutMode.MASKED_IMAGE)
+        box = result.cutout.bbox
+        self.assertEqual(box.x.size, 29)
+        self.assertEqual(box.y.size, 12)
+
+    def test_process_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             for cutout_mode in CutoutMode:
-                # Try each available projection finder at least once.
-                proj_finder = self.projectionFinders[cutout_mode.value % len(self.projectionFinders)]
+                proj_finder = self.projectionFinders[0]
                 cutoutBackend = ImageCutoutFactory(self.butler, proj_finder, tempdir)
-                result = cutoutBackend.extract_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
-                match result.cutout:
-                    case lsst.images.MaskedImage():
-                        box = result.cutout.bbox
-                        array = result.cutout.image.array
-                    case lsst.images.Image():
-                        array = result.cutout.array
-                        box = result.cutout.bbox
-                    case astropy.io.fits.HDUList():
-                        hdu = result.cutout[1]
-                        array = hdu.data
-                        # Only checks the shape.
-                        box = lsst.images.Box.factory[1 : hdu.shape[0] + 1, 1 : hdu.shape[1] + 1]
-                    case _:
-                        raise RuntimeError(f"Unexpected cutout type: {type(result.cutout)}")
 
-                with self.subTest(cutout_mode=cutout_mode):
-                    self.assertEqual(box.x.size, 29)
-                    self.assertEqual(box.y.size, 28)
+                output = cutoutBackend.process_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
+                self.assertTrue(output.exists())
 
-                    # We are reading these values from the fuzzed data that
-                    # has no scientific content but we can test that each
-                    # cutout is returning the same value. These numbers have
-                    # not been validated by external tooling and will change
-                    # on redoing the fuzzing.
-                    self.assertFloatsAlmostEqual(array[14, 15], 2.788926362991333)
-                    self.assertFloatsAlmostEqual(array[1, 1], 7.183607578277588)
-                    self.assertFloatsAlmostEqual(array[27, 28], -11.042882919311523)
+                # We should be able to read this back in using generic reader.
+                result = lsst.images.serialization.read(output)
+                self.assertIsInstance(result, lsst.images.GeneralizedImage)
 
-                    output = cutoutBackend.process_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
-                    self.assertTrue(output.exists())
+    def test_process_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            for cutout_mode in CutoutMode:
+                proj_finder = self.projectionFinders[0]
+                cutoutBackend = ImageCutoutFactory(self.butler, proj_finder, tempdir)
 
-                    output = cutoutBackend.process_uuid(self.stencil, dataRef.id, cutout_mode=cutout_mode)
-                    self.assertTrue(output.exists())
+                output = cutoutBackend.process_uuid(self.stencil, self.ref.id, cutout_mode=cutout_mode)
+                self.assertTrue(output.exists())
+
+                # We should be able to read this back in using generic reader.
+                result = lsst.images.serialization.read(output)
+                self.assertIsInstance(result, lsst.images.GeneralizedImage)
 
     def test_provenance_in_primary_header(self):
         """Cutout provenance must land in the primary FITS header for every
         cutout mode, including the native ``lsst.images`` container modes.
         """
-        dataRef = self.butler.registry.findDataset("deep_coadd", dataId=self.dataId)
         provenance_keys = ("BTLRUUID", "BTLRNAME", "DATE-CUT", "CUTVERS")
 
         with tempfile.TemporaryDirectory() as tempdir:
             cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinders[0], tempdir)
             for cutout_mode in CutoutMode:
                 with self.subTest(cutout_mode=cutout_mode):
-                    output = cutoutBackend.process_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
+                    output = cutoutBackend.process_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
                     with output.open("rb") as fh, astropy.io.fits.open(fh) as hdul:
                         header = hdul[0].header
                     for key in provenance_keys:
@@ -119,8 +158,8 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
                             header,
                             f"{key} missing from primary header for {cutout_mode}",
                         )
-                    self.assertEqual(header["BTLRUUID"], dataRef.id.hex)
-                    self.assertEqual(header["BTLRNAME"], dataRef.datasetType.name)
+                    self.assertEqual(header["BTLRUUID"], self.ref.id.hex)
+                    self.assertEqual(header["BTLRNAME"], self.ref.datasetType.name)
 
 
 if __name__ == "__main__":
