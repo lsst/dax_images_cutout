@@ -102,7 +102,7 @@ class Extraction:
     """Fully-resolved reference to the dataset the cutout is from.
     """
 
-    def mask(self, name: str = "STENCIL") -> None:
+    def mask(self, name: str = "OUTSIDE_STENCIL") -> None:
         """Set the bitmask to show the approximate coverage of nonrectangular
         stencils.
 
@@ -119,10 +119,10 @@ class Extraction:
         """
         if isinstance(self.cutout, lsst.images.MaskedImage):
             mask = self.cutout.mask
-            # Adding a new plane to an lsst.images.Mask after construction is
-            # not yet supported; set the plane only if it already exists.
-            if name in mask.schema.names:
-                self.pixel_stencil.set_mask(mask, name)
+            # Create the new plane if it's not there.
+            if name not in mask.schema.names:
+                mask.add_plane(name, "Pixel lies outside the stencil")
+            self.pixel_stencil.set_mask(mask, name)
             return
 
         # Try afw variants. Protect the imports (if the imports fail it is
