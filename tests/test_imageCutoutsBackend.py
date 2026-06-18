@@ -23,6 +23,8 @@ import os.path
 import tempfile
 import unittest
 
+import astropy
+
 import lsst.daf.butler
 import lsst.images
 import lsst.sphgeom
@@ -64,17 +66,16 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
         )
 
         self.dataId = {"patch": 24, "tract": 3828, "band": "r", "skymap": "DC2"}
+        self.ref = self.butler.find_dataset("deepCoadd_calexp", data_id=self.dataId)
 
     def test_extract_ref(self):
         """Test that extract_ref produces a reasonable cutout."""
-        dataRef = self.butler.registry.findDataset("deepCoadd_calexp", dataId=self.dataId)
-
         with tempfile.TemporaryDirectory() as tempdir:
             for cutout_mode in CutoutMode:
                 # Try each available projection finder at least once.
                 proj_finder = self.projectionFinders[cutout_mode.value % len(self.projectionFinders)]
                 cutoutBackend = ImageCutoutFactory(self.butler, proj_finder, tempdir)
-                result = cutoutBackend.extract_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
+                result = cutoutBackend.extract_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
                 # The galaxy should be near the center of the image.
                 match result.cutout:
                     case lsst.afw.image.Exposure() | lsst.afw.image.MaskedImage():
@@ -93,11 +94,41 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
                 self.assertFloatsAlmostEqual(array[1, 1], -0.14575983583927155)
                 self.assertFloatsAlmostEqual(array[100, 100], 0.08674515783786774)
 
-                output = cutoutBackend.process_ref(self.stencil, dataRef, cutout_mode=cutout_mode)
+                output = cutoutBackend.process_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
                 self.assertTrue(output.exists())
 
-                output = cutoutBackend.process_uuid(self.stencil, dataRef.id, cutout_mode=cutout_mode)
+                output = cutoutBackend.process_uuid(self.stencil, self.ref.id, cutout_mode=cutout_mode)
                 self.assertTrue(output.exists())
+
+    def test_provenance_in_primary_header(self):
+        """Cutout provenance must land in the primary FITS header for every
+        cutout mode, including the native ``lsst.images`` container modes.
+        """
+        provenance_keys = ("BTLRUUID", "BTLRNAME", "DATE-CUT", "CUTVERS")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinders[0], tempdir)
+            for cutout_mode in CutoutMode:
+                with self.subTest(cutout_mode=cutout_mode):
+                    output = cutoutBackend.process_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
+                    with output.open("rb") as fh, astropy.io.fits.open(fh) as hdul:
+                        header = hdul[0].header
+                    for key in provenance_keys:
+                        self.assertIn(
+                            key,
+                            header,
+                            f"{key} missing from primary header for {cutout_mode}",
+                        )
+                    self.assertEqual(header["BTLRUUID"], self.ref.id.hex)
+                    self.assertEqual(header["BTLRNAME"], self.ref.datasetType.name)
+
+                    # This test file has a BGMEAN header in the original
+                    # primary header and we need to ensure that it still
+                    # exists in the cutout to indicate that the primary
+                    # header was propagated. IMAGE does not have it since
+                    # IMAGE only reads the second header without merging
+                    if cutout_mode != CutoutMode.IMAGE_ONLY:
+                        self.assertIn("BGMEAN", header)
 
 
 if __name__ == "__main__":

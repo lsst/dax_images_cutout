@@ -535,8 +535,7 @@ class ImageCutoutFactory:
             projection, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
             # Transform the stencil to pixel coordinates.
             pixel_stencil = stencil.to_pixels(projection, bbox)
-        # Somewhere to store metadata.
-        metadata = PropertyList()
+
         # Actually read the cutout.  Leave it to the butler to cache remote
         # files locally or do partial remote reads.
         with time_this(
@@ -553,9 +552,12 @@ class ImageCutoutFactory:
                 case CutoutMode.STRIPPED_EXPOSURE:
                     assert pixel_stencil is not None
                     cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox.to_legacy()})
-                    metadata = cutout.metadata  # Track metadata externally.
-                    timesys = metadata.get("TIMESYS", timesys)
+                    original_metadata = cutout.metadata
+                    timesys = original_metadata.get("TIMESYS", timesys)
                     cutout = makeExposure(cutout.maskedImage, wcs=cutout.wcs)
+
+                    # A full exposure so we can store the metadata back in it.
+                    cutout.setMetadata(original_metadata)
                 case CutoutMode.IMAGE_ONLY:
                     assert pixel_stencil is not None
                     cutout = self.butler.get(
@@ -580,8 +582,12 @@ class ImageCutoutFactory:
                     masked_image = makeMaskedImage(image, mask, variance)
                     cutout = makeExposure(masked_image, wcs=wcs)
 
-                    metadata = self.butler.get(ref.makeComponentRef("metadata"))
-                    timesys = metadata.get("TIMESYS", timesys)
+                    original_metadata = self.butler.get(ref.makeComponentRef("metadata"))
+                    timesys = original_metadata.get("TIMESYS", timesys)
+
+                    # The cutout is an Exposure so we can attach metadata.
+                    cutout.setMetadata(original_metadata)
+
                 case CutoutMode.ASTROPY_IMAGE | CutoutMode.ASTROPY_MASKED_IMAGE:
                     # Bypass butler and read the pixel HDU directly.
                     cutout, pixel_stencil, timesys = self._read_astropy_hdulist(cutout_mode, stencil, ref)
@@ -589,22 +595,12 @@ class ImageCutoutFactory:
                     raise ValueError(f"Unsupported cutout mode: {cutout_mode}")
 
         # Create some FITS metadata with the cutout parameters.
-        metadata.set("BTLRUUID", ref.id.hex, "Butler dataset UUID this cutout was extracted from.")
-        metadata.set(
-            "BTLRNAME", ref.datasetType.name, "Butler dataset type name this cutout was extracted from."
-        )
-        for n, (k, v) in enumerate(ref.dataId.required.items()):
-            # Write data ID dictionary sort of like a list of 2-tuples, to make
-            # it easier to stay within the FITS 8-char key limit.
-            metadata.set(f"BTLRK{n:03}", k, f"Name of dimension {n} in the data ID.")
-            metadata.set(f"BTLRV{n:03}", v, f"Value of dimension {n} in the data ID.")
-        stencil.to_fits_metadata(metadata)
+        provenance_metadata = self._record_cutout_provenance(ref, now, stencil, timesys)
 
-        # Record the time and software version.
-        now.format = "fits"
-        now = now.tai if timesys.lower() == "tai" else now.utc
-        metadata.set("DATE-CUT", str(now), "Time of cutout extraction")
-        metadata.set("CUTVERS", __version__, "dax_images_cutout software version")
+        # Store in PropertyList since that is needed for legacy but might
+        # confuse Astropy lsst.images types.
+        metadata = PropertyList()
+        metadata.update(provenance_metadata)
 
         # Every supported cutout mode produces a pixel stencil above.
         assert pixel_stencil is not None
@@ -704,6 +700,24 @@ class ImageCutoutFactory:
                 cutout, pixel_stencil, timesys = self._read_astropy_hdulist(cutout_mode, stencil, ref)
 
         # Create some FITS metadata with the cutout parameters.
+        metadata = self._record_cutout_provenance(ref, now, stencil, timesys)
+
+        # Every supported cutout mode produces a pixel stencil above.
+        assert pixel_stencil is not None
+        return Extraction(
+            cutout=cutout,
+            sky_stencil=stencil,
+            pixel_stencil=pixel_stencil,
+            metadata=metadata,
+            origin_ref=ref,
+        )
+
+    def _record_cutout_provenance(
+        self, ref: DatasetRef, start_time: astropy.time.Time, stencil: SkyStencil, timesys: str
+    ) -> dict[str, str | int]:
+        metadata = {}
+
+        # Create some FITS metadata with the cutout parameters.
         # Some of these are added as provenance by the butler on write so may
         # no longer be necessary.
         metadata["BTLRUUID"] = ref.id.hex
@@ -716,20 +730,12 @@ class ImageCutoutFactory:
         stencil.to_fits_metadata(metadata)
 
         # Record the time and software version.
-        now.format = "fits"
-        now = now.tai if timesys.lower() == "tai" else now.utc
-        metadata["DATE-CUT"] = str(now)
+        start_time.format = "fits"
+        start_time = start_time.tai if timesys.lower() == "tai" else start_time.utc
+        metadata["DATE-CUT"] = str(start_time)
         metadata["CUTVERS"] = __version__
 
-        # Every supported cutout mode produces a pixel stencil above.
-        assert pixel_stencil is not None
-        return Extraction(
-            cutout=cutout,
-            sky_stencil=stencil,
-            pixel_stencil=pixel_stencil,
-            metadata=metadata,
-            origin_ref=ref,
-        )
+        return metadata
 
     def extract_uuid(
         self,
