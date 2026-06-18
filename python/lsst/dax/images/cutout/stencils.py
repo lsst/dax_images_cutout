@@ -127,8 +127,8 @@ class PixelStencil(ABC):
         """
         raise NotImplementedError()
 
-    def set_mask(self, mask: Mask, plane: str) -> None:
-        """Set a mask plane for pixels whose centers the stencil covers.
+    def set_mask(self, mask: Mask, plane: str, *, covered: bool = True) -> None:
+        """Set a mask plane for pixels inside or outside the stencil.
 
         Parameters
         ----------
@@ -136,13 +136,22 @@ class PixelStencil(ABC):
             Mask to modify in-place.  Its schema must already define ``plane``
             and its bounding box must contain `bbox`.
         plane : `str`
-            Name of the mask plane to set where the stencil covers a pixel.
+            Name of the mask plane to set.
+        covered : `bool`, optional
+            If `True` (default), set ``plane`` where the stencil covers a pixel
+            center.  If `False`, set ``plane`` where the stencil does *not*
+            cover a pixel, including the region of ``mask`` that lies outside
+            `bbox`.
         """
-        covered = self._coverage()
-        full = np.zeros(mask.bbox.shape, dtype=bool)
+        coverage = self._coverage()
+        if not covered:
+            coverage = np.logical_not(coverage)
+        # Pixels outside the stencil's bounding box are never covered, so they
+        # take the value assigned to uncovered pixels.
+        full = np.full(mask.bbox.shape, not covered, dtype=bool)
         y_off = self.bbox.y.min - mask.bbox.y.min
         x_off = self.bbox.x.min - mask.bbox.x.min
-        full[y_off : y_off + self.bbox.shape.y, x_off : x_off + self.bbox.shape.x] = covered
+        full[y_off : y_off + self.bbox.shape.y, x_off : x_off + self.bbox.shape.x] = coverage
         mask.set(plane, full)
 
 

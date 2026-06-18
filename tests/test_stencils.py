@@ -165,6 +165,30 @@ class BackendComparisonTestCase(unittest.TestCase):
         self.assertEqual(ast_box, sph_box)
         self.assertLessEqual(int(np.sum(ast_mask != sph_mask)), 12)
 
+    def test_set_mask_covered_false_marks_outside(self) -> None:
+        """``set_mask(covered=False)`` flags exactly the pixels the stencil
+        does not cover, including the region of the mask outside the stencil's
+        bounding box.
+        """
+        circle = SkyCircle(self.center, _arcsec(1.0))
+        pixel_stencil = circle.to_pixels(self.projection, self.box)
+
+        inside = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=self.box)
+        pixel_stencil.set_mask(inside, "STENCIL")
+
+        outside = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=self.box)
+        pixel_stencil.set_mask(outside, "STENCIL", covered=False)
+
+        inside_arr = inside.get("STENCIL")
+        outside_arr = outside.get("STENCIL")
+        # The two planes partition the mask: every pixel is flagged in exactly
+        # one of them.
+        np.testing.assert_array_equal(outside_arr, np.logical_not(inside_arr))
+        # The stencil covers some pixels but not the whole box, so neither
+        # plane is empty.
+        self.assertTrue(inside_arr.any())
+        self.assertTrue(outside_arr.any())
+
 
 def _brute_force_stencil_array(sky_stencil: SkyStencil, wcs: astropy.wcs.WCS, box: Box) -> np.ndarray:
     """Make a boolean ``(ny, nx)`` array, `True` where a center is inside.

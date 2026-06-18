@@ -122,7 +122,7 @@ class Extraction:
             # Create the new plane if it's not there.
             if name not in mask.schema.names:
                 mask.add_plane(name, "Pixel lies outside the stencil")
-            self.pixel_stencil.set_mask(mask, name)
+            self.pixel_stencil.set_mask(mask, name, covered=False)
             return
 
         # Try afw variants. Protect the imports (if the imports fail it is
@@ -144,14 +144,14 @@ class Extraction:
         # Stage the coverage in an lsst.images.Mask, then OR it into the afw
         # mask plane so stencils never sees an afw object.
         images_mask = ImagesMask(
-            schema=MaskSchema([MaskPlane(name, "stencil coverage")]),
+            schema=MaskSchema([MaskPlane(name, "Pixel lies outside the stencil")]),
             bbox=Box.from_legacy(mask.getBBox()),
         )
-        self.pixel_stencil.set_mask(images_mask, name)
-        covered = images_mask.get(name)
+        self.pixel_stencil.set_mask(images_mask, name, covered=False)
+        outside = images_mask.get(name)
         mask.addMaskPlane(name)
         bits = mask.getPlaneBitMask(name)
-        mask.array[:, :] |= (bits * covered).astype(mask.array.dtype)
+        mask.array[:, :] |= (bits * outside).astype(mask.array.dtype)
 
     def write_fits(self, path: str, logger: logging.Logger | None = None) -> None:
         """Write the cutout to a FITS file.
@@ -246,7 +246,7 @@ class ImageCutoutFactory:
         stencil: SkyStencil,
         ref: DatasetRef,
         *,
-        mask_plane: str | None = "STENCIL",
+        mask_plane: str | None = "OUTSIDE_STENCIL",
         cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE,
     ) -> ResourcePath:
         """Extract and write a cutout from a fully-resolved `DatasetRef`.
@@ -260,10 +260,11 @@ class ImageCutoutFactory:
             Must have ``DatasetRef.id`` not `None` (use `extract_search`
             instead when this is not the case).  Need not have an expanded data
             ID.  May represent an image-like dataset component.
-        mask : `str`, optional
-            If not `None`, set this mask plane in the extracted cutout showing
-            the approximate stencil region.  Does nothing if the image type
-            does not have a mask plane.  Defaults to ``STENCIL``.
+        mask_plane : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout to flag
+            pixels that lie outside the stencil region.  Does nothing if the
+            image type does not have a mask plane.  Defaults to
+            ``OUTSIDE_STENCIL``.
 
         Returns
         -------
@@ -281,7 +282,7 @@ class ImageCutoutFactory:
         uuid: UUID,
         *,
         component: str | None = None,
-        mask_plane: str | None = "STENCIL",
+        mask_plane: str | None = "OUTSIDE_STENCIL",
         cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE,
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by its UUID.
@@ -295,10 +296,11 @@ class ImageCutoutFactory:
         component : `str`, optional
             If not `None` (default), read this component instead of the
             composite dataset.
-        mask : `str`, optional
-            If not `None`, set this mask plane in the extracted cutout showing
-            the approximate stencil region.  Does nothing if the image type
-            does not have a mask plane.  Defaults to ``STENCIL``.
+        mask_plane : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout to flag
+            pixels that lie outside the stencil region.  Does nothing if the
+            image type does not have a mask plane.  Defaults to
+            ``OUTSIDE_STENCIL``.
 
         Returns
         -------
@@ -317,7 +319,7 @@ class ImageCutoutFactory:
         data_id: DataId,
         collections: Sequence[str],
         *,
-        mask_plane: str | None = "STENCIL",
+        mask_plane: str | None = "OUTSIDE_STENCIL",
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by a
         (dataset type, data ID, collection path) tuple.
@@ -335,10 +337,11 @@ class ImageCutoutFactory:
         collections : `Iterable` [ `str` ]
             Collections to search for the dataset, in the order they should be
             searched.
-        mask : `str`, optional
-            If not `None`, set this mask plane in the extracted cutout showing
-            the approximate stencil region.  Does nothing if the image type
-            does not have a mask plane.  Defaults to ``STENCIL``.
+        mask_plane : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout to flag
+            pixels that lie outside the stencil region.  Does nothing if the
+            image type does not have a mask plane.  Defaults to
+            ``OUTSIDE_STENCIL``.
 
         Returns
         -------
