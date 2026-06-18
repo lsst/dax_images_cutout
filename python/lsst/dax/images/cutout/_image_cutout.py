@@ -79,7 +79,7 @@ class Extraction:
     image cutout backend.
     """
 
-    cutout: Image | Mask | MaskedImage | Exposure | astropy.io.fits.HDUList | lsst.images.GeneralizedImage
+    cutout: Image | Mask | MaskedImage | Exposure | lsst.images.GeneralizedImage
     """The image cutout itself.
     """
 
@@ -181,10 +181,6 @@ class Extraction:
             elif hasattr(self.cutout, "getMetadata") and hasattr(self.cutout, "writeFits"):
                 self.cutout.metadata.update(self.metadata)
                 self.cutout.writeFits(path)
-            elif isinstance(self.cutout, astropy.io.fits.HDUList):
-                self.cutout[0].header.update(self.metadata)
-                with open(path, "wb") as fh:
-                    self.cutout.writeto(fh)
             else:
                 self.cutout.writeFits(path, metadata=self.metadata)
 
@@ -382,35 +378,46 @@ class ImageCutoutFactory:
 
     def _read_astropy_hdulist(
         self,
+        cutout_mode: CutoutMode,
         stencil: SkyStencil,
         ref: DatasetRef,
-        pixel_components: set[str],
-        fsspec_kwargs: dict[str, object],
-    ) -> tuple[astropy.io.fits.HDUList, PixelStencil | None, str]:
+    ) -> tuple[lsst.images.GeneralizedImage, PixelStencil | None, str]:
         """Read the primary header and pixel HDUs, cut to the stencil.
 
         Parameters
         ----------
-        stencil : `SkyStencil`
+        cutout_mode
+            The requested cutout mode. Must be either an Astropy image or
+            masked image request.
+        stencil
             Sky-coordinate stencil defining the cutout region.
         ref : `DatasetRef`
             Resolved reference to the dataset to read.
-        pixel_components : `set` [ `str` ]
-            Lower-case EXTNAMEs to extract (e.g. ``{"image"}``).  Consumed in
-            place as components are found.
-        fsspec_kwargs : `dict`
-            Keyword arguments forwarded to ``fsspec`` ``open``.
 
         Returns
         -------
-        hdulist : `astropy.io.fits.HDUList`
-            Primary HDU plus one cutout HDU per requested pixel component.
+        result : `lsst.images.GeneralizedImage`
+            The resultant generalized image constructed from the individual
+            HDUs.
         pixel_stencil : `PixelStencil` or `None`
             Pixel-coordinate stencil computed from the first pixel HDU, or
             `None` if no pixel HDU was found.
         timesys : `str`
             ``TIMESYS`` from the primary header, or ``"UTC"``.
         """
+        if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
+            raise ValueError(f"Unexpected cutout mode {cutout_mode} encountered")
+
+        pixel_components = (
+            {"image"} if cutout_mode == CutoutMode.ASTROPY_IMAGE else {"image", "mask", "variance"}
+        )
+        # Tune the fsspec cache to match what we use in lsst.images.
+        maxblocks = max(2, READ_CACHE_MAX_BYTES // DEFAULT_PAGE_SIZE)
+        fsspec_kwargs = {
+            "block_size": DEFAULT_PAGE_SIZE,
+            "cache_type": _READ_CACHE_TYPE,
+            "cache_options": {"maxblocks": maxblocks},
+        }
         timesys = "UTC"
         pixel_stencil: PixelStencil | None = None
         bbox: Box | None = None
@@ -422,7 +429,12 @@ class ImageCutoutFactory:
             for hdu in fits_obj:
                 if not found_primary:
                     hdul.append(hdu.copy())
-                    timesys = hdul[0].header.get("TIMESYS", timesys)
+                    timesys_hdr = hdul[0].header.get("TIMESYS", timesys)
+                    if timesys_hdr:
+                        # For mypy since in theory a FITS header can exist
+                        # but be undefined.
+                        timesys = str(timesys_hdr)
+
                     found_primary = True
                     continue
 
@@ -461,7 +473,15 @@ class ImageCutoutFactory:
 
                 if not pixel_components:
                     break
-        return astropy.io.fits.HDUList(hdus=hdul), pixel_stencil, timesys
+
+        hdulist = astropy.io.fits.HDUList(hdus=hdul)
+        result: lsst.images.GeneralizedImage
+        if cutout_mode == CutoutMode.ASTROPY_IMAGE:
+            result = lsst.images.Image.from_hdu_list(hdulist)
+        else:
+            result = lsst.images.MaskedImage.from_hdu_list(hdulist)
+
+        return result, pixel_stencil, timesys
 
     def _extract_ref_legacy(
         self, stencil: SkyStencil, ref: DatasetRef, cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE
@@ -553,15 +573,7 @@ class ImageCutoutFactory:
                     timesys = metadata.get("TIMESYS", timesys)
                 case CutoutMode.ASTROPY_IMAGE | CutoutMode.ASTROPY_MASKED_IMAGE:
                     # Bypass butler and read the pixel HDU directly.
-                    pixel_components = (
-                        {"image"}
-                        if cutout_mode == CutoutMode.ASTROPY_IMAGE
-                        else {"image", "mask", "variance"}
-                    )
-                    # TODO: Convert this to a lsst.images type.
-                    cutout, pixel_stencil, timesys = self._read_astropy_hdulist(
-                        stencil, ref, pixel_components, {}
-                    )
+                    cutout, pixel_stencil, timesys = self._read_astropy_hdulist(cutout_mode, stencil, ref)
                 case _:
                     raise ValueError(f"Unsupported cutout mode: {cutout_mode}")
 
@@ -677,22 +689,8 @@ class ImageCutoutFactory:
                 kwargs={"id": str(ref.id), "cutout_mode": str(cutout_mode), "stencil": str(stencil)},
                 level=_TIMER_LOG_LEVEL,
             ):
-                if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
-                    raise ValueError(f"Unexpected cutout mode {cutout_mode} encountered")
-
-                pixel_components = (
-                    {"image"} if cutout_mode == CutoutMode.ASTROPY_IMAGE else {"image", "mask", "variance"}
-                )
-                # Tune the fsspec cache to match what we use in lsst.images.
-                maxblocks = max(2, READ_CACHE_MAX_BYTES // DEFAULT_PAGE_SIZE)
-                fsspec_kwargs = {
-                    "block_size": DEFAULT_PAGE_SIZE,
-                    "cache_type": _READ_CACHE_TYPE,
-                    "cache_options": {"maxblocks": maxblocks},
-                }
-                cutout, pixel_stencil, timesys = self._read_astropy_hdulist(
-                    stencil, ref, pixel_components, fsspec_kwargs
-                )
+                # Bypass butler and lsst.images and go straight to the HDUs.
+                cutout, pixel_stencil, timesys = self._read_astropy_hdulist(cutout_mode, stencil, ref)
 
         # Create some FITS metadata with the cutout parameters.
         # Some of these are added as provenance by the butler on write so may
