@@ -23,10 +23,8 @@ import os.path
 import tempfile
 import unittest
 
-import astropy.io.fits
-
 import lsst.daf.butler
-import lsst.resources
+import lsst.images
 import lsst.sphgeom
 import lsst.utils.tests
 from lsst.dax.images.cutout import CutoutMode, ImageCutoutFactory, projection_finders, stencils
@@ -85,11 +83,8 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
                     case lsst.afw.image.Image():
                         array = result.cutout.array
                         box = result.cutout.getBBox()
-                    case astropy.io.fits.HDUList():
-                        hdu = result.cutout[1]
-                        array = hdu.data
-                        # Only checks the shape.
-                        box = lsst.geom.Box2I(lsst.geom.Point2I([1, 1]), lsst.geom.Extent2I(hdu.shape))
+                    case lsst.images.GeneralizedImage():
+                        box = result.cutout.bbox.to_legacy()
                     case _:
                         raise RuntimeError(f"Unexpected cutout type: {type(result.cutout)}")
                 self.assertEqual(box.width, 101)

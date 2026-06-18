@@ -439,6 +439,14 @@ class ImageCutoutFactory:
                         timesys = str(timesys_hdr)
 
                     found_primary = True
+
+                    # Some old legacy data erroneously wrote "IMAGE" to the
+                    # EXTNAME of the primary header. Since we are assuming
+                    # here that the primary never has pixel data, fix the
+                    # header to prevent downstream confusion.
+                    if "EXTNAME" in hdul[0].header:
+                        del hdul[0].header["EXTNAME"]
+
                     continue
 
                 hdr = hdu.header
