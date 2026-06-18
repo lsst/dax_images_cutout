@@ -33,6 +33,7 @@ from lsst.dax.images.cutout.stencils import (
     MaskBackend,
     SkyCircle,
     SkyStencil,
+    StencilNotContainedError,
     _round_box_from_bounds,
 )
 from lsst.images import Box, GeneralFrame, Mask, MaskPlane, MaskSchema, SkyProjection
@@ -208,25 +209,38 @@ def _check_to_pixel(
     sky_stencil: SkyStencil,
     wcs: astropy.wcs.WCS,
     *,
+    box: Box = TEST_BOX,
+    expected_bbox: Box | None = None,
     backend: MaskBackend = MaskBackend.AST,
     max_missing: int = 0,
     max_extra: int = 0,
     plot: bool = False,
 ) -> None:
-    """Check a `SkyStencil.to_pixels` result against brute force."""
+    """Check a `SkyStencil.to_pixels` result against brute force.
+
+    ``box`` is the reference bounding box passed to `to_pixels`; when it does
+    not fully contain the stencil the result is clipped to it.  Brute force is
+    evaluated over ``box`` too, which yields the correct expected coverage for
+    a clipped stencil: a pixel that is inside the region and inside ``box`` is
+    necessarily inside the clipped bounding box, since the region is contained
+    by its own tight bounding box.  ``expected_bbox``, if given, is asserted to
+    equal the clipped result bounding box.
+    """
     projection = SkyProjection.from_fits_wcs(wcs, GeneralFrame(unit=u.pix))
-    pixel_stencil = sky_stencil.to_pixels(projection, TEST_BOX, backend=backend)
-    test_case.assertTrue(TEST_BOX.contains(pixel_stencil.bbox))
-    mask = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=TEST_BOX)
+    pixel_stencil = sky_stencil.to_pixels(projection, box, backend=backend)
+    test_case.assertTrue(box.contains(pixel_stencil.bbox))
+    if expected_bbox is not None:
+        test_case.assertEqual(pixel_stencil.bbox, expected_bbox)
+    mask = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=box)
     pixel_stencil.set_mask(mask, "STENCIL")
     got = mask.get("STENCIL")
-    check_array = _brute_force_stencil_array(sky_stencil, wcs, TEST_BOX)
+    check_array = _brute_force_stencil_array(sky_stencil, wcs, box)
     missing = np.logical_and(check_array, np.logical_not(got))
     extra = np.logical_and(got, np.logical_not(check_array))
     if plot:
         from matplotlib import pyplot
 
-        display_array = np.zeros((TEST_BOX.shape.y, TEST_BOX.shape.x, 3), dtype=np.uint8)
+        display_array = np.zeros((box.shape.y, box.shape.x, 3), dtype=np.uint8)
         display_array[:, :, 0] = 255 * check_array
         display_array[:, :, 1] = 255 * got
         pyplot.imshow(display_array, origin="lower", interpolation="nearest")
@@ -234,6 +248,104 @@ def _check_to_pixel(
         pyplot.show()
     test_case.assertLessEqual(int(missing.sum()), max_missing)
     test_case.assertLessEqual(int(extra.sum()), max_extra)
+
+
+class StencilContainmentTestCase(unittest.TestCase):
+    """Clipping and raising when a stencil only partially overlaps, or does not
+    overlap at all, the reference bounding box passed to `to_pixels`.
+
+    The 1 arcsec circle used throughout has the fixed tight pixel bounding box
+    ``Box.factory[-3:18, -5:16]`` under `_make_wcs`, so the reference boxes
+    below produce exactly predictable intersections.
+    """
+
+    # Reference boxes relative to the circle's tight pixel bbox
+    # [y=-3:18, x=-5:16].
+    PARTIAL_BOX = Box.factory[5:30, 5:30]
+    PARTIAL_CLIPPED = Box.factory[5:18, 5:16]
+    INSIDE_STENCIL_BOX = Box.factory[12:18, 12:16]
+    TOUCHING_BOX = Box.factory[-3:18, 16:30]
+    DISJOINT_BOX = Box.factory[100:120, 100:120]
+
+    # Per-backend rasterization tolerance, matching the existing circle tests.
+    BACKEND_TOLERANCE = {MaskBackend.AST: 2, MaskBackend.SPHGEOM: 0}
+
+    def setUp(self) -> None:
+        self.center = LonLat.fromDegrees(12.0, 13.0)
+        self.wcs = _make_wcs()
+        self.projection = SkyProjection.from_fits_wcs(self.wcs, GeneralFrame(unit=u.pix))
+
+    def _circle(self, *, clip: bool) -> SkyCircle:
+        return SkyCircle(self.center, _arcsec(1.0), clip=clip)
+
+    # Box resolution happens in `to_pixels` before any mask backend is
+    # selected, so the raising behavior is backend-independent; the default
+    # backend is sufficient for the raising tests below.
+
+    def test_clip_false_raises_on_partial_overlap(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=False).to_pixels(self.projection, self.PARTIAL_BOX)
+
+    def test_clip_false_raises_when_box_inside_stencil(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=False).to_pixels(self.projection, self.INSIDE_STENCIL_BOX)
+
+    def test_clip_false_raises_when_disjoint(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=False).to_pixels(self.projection, self.DISJOINT_BOX)
+
+    def test_clip_true_raises_when_touching(self) -> None:
+        # The box starts one pixel beyond the tight bbox's max x, so the two
+        # share no pixel and clipping cannot produce an overlap.
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=True).to_pixels(self.projection, self.TOUCHING_BOX)
+
+    def test_clip_true_raises_when_disjoint(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=True).to_pixels(self.projection, self.DISJOINT_BOX)
+
+    def test_clip_true_unchanged_when_contained(self) -> None:
+        # A fully contained stencil keeps its tight bbox even when clipping.
+        for backend, tolerance in self.BACKEND_TOLERANCE.items():
+            with self.subTest(backend=backend):
+                _check_to_pixel(
+                    self,
+                    self._circle(clip=True),
+                    self.wcs,
+                    box=TEST_BOX,
+                    expected_bbox=Box.factory[-3:18, -5:16],
+                    backend=backend,
+                    max_missing=tolerance,
+                    max_extra=tolerance,
+                )
+
+    def test_clip_true_clips_to_intersection_on_partial_overlap(self) -> None:
+        for backend, tolerance in self.BACKEND_TOLERANCE.items():
+            with self.subTest(backend=backend):
+                _check_to_pixel(
+                    self,
+                    self._circle(clip=True),
+                    self.wcs,
+                    box=self.PARTIAL_BOX,
+                    expected_bbox=self.PARTIAL_CLIPPED,
+                    backend=backend,
+                    max_missing=tolerance,
+                    max_extra=tolerance,
+                )
+
+    def test_clip_true_clips_to_box_when_box_inside_stencil(self) -> None:
+        for backend, tolerance in self.BACKEND_TOLERANCE.items():
+            with self.subTest(backend=backend):
+                _check_to_pixel(
+                    self,
+                    self._circle(clip=True),
+                    self.wcs,
+                    box=self.INSIDE_STENCIL_BOX,
+                    expected_bbox=self.INSIDE_STENCIL_BOX,
+                    backend=backend,
+                    max_missing=tolerance,
+                    max_extra=tolerance,
+                )
 
 
 if __name__ == "__main__":
