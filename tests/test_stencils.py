@@ -24,6 +24,7 @@ from __future__ import annotations
 import unittest
 
 import astropy.coordinates
+import astropy.io.fits
 import astropy.units as u
 import astropy.wcs
 import numpy as np
@@ -346,6 +347,34 @@ class StencilContainmentTestCase(unittest.TestCase):
                     max_missing=tolerance,
                     max_extra=tolerance,
                 )
+
+
+class StencilFitsMetadataTestCase(unittest.TestCase):
+    """`SkyStencil.to_fits_metadata` returns an `astropy.io.fits.Header` whose
+    cards carry the descriptive comments.
+    """
+
+    def test_circle(self) -> None:
+        circle = SkyCircle(LonLat.fromDegrees(12.0, 13.0), _arcsec(1.0))
+        header = circle.to_fits_metadata()
+        self.assertIsInstance(header, astropy.io.fits.Header)
+        self.assertEqual(header["ST_TYPE"], "CIRCLE")
+        self.assertEqual(header.comments["ST_TYPE"], "Type of stencil used to create this cutout")
+        self.assertAlmostEqual(header["ST_RA"], 12.0)
+        self.assertAlmostEqual(header["ST_DEC"], 13.0)
+        self.assertAlmostEqual(header["ST_RAD"], (1.0 * u.arcsec).to_value(u.deg))
+        self.assertEqual(header.comments["ST_RAD"], "[deg] Circle radius")
+
+    def test_polygon(self) -> None:
+        polygon = SkyCircle(LonLat.fromDegrees(12.0, 13.0), _arcsec(2.0)).to_polygon(n_vertices=4)
+        header = polygon.to_fits_metadata()
+        self.assertIsInstance(header, astropy.io.fits.Header)
+        self.assertEqual(header["ST_TYPE"], "POLYGON")
+        self.assertEqual(header.comments["ST_TYPE"], "Type of stencil used to create this cutout")
+        self.assertIn("ST_RA00", header)
+        self.assertIn("ST_DEC00", header)
+        self.assertEqual(header.comments["ST_RA00"], "[deg] Vertex 0 Right Ascension")
+        self.assertEqual(header.comments["ST_DEC00"], "[deg] Vertex 0 Declination")
 
 
 if __name__ == "__main__":

@@ -33,11 +33,11 @@ __all__ = (
 import enum
 import struct
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, MutableMapping
+from collections.abc import Iterable
 from hashlib import blake2b
-from typing import Any
 
 import astropy.coordinates
+import astropy.io.fits
 import astropy.units as u
 import numpy as np
 import starlink.Ast as Ast
@@ -315,8 +315,12 @@ class SkyStencil(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def to_fits_metadata(self, metadata: MutableMapping[str, Any]) -> None:
-        """Write FITS header entries that describe the stencil."""
+    def to_fits_metadata(self) -> astropy.io.fits.Header:
+        """Return FITS header cards that describe the stencil.
+
+        The cards carry per-keyword comments and are merged into the cutout
+        provenance header.
+        """
         raise NotImplementedError()
 
     @property
@@ -434,12 +438,14 @@ class SkyCircle(SkyStencil):
         # Docstring inherited.
         return lsst.sphgeom.Circle(UnitVector3d(self._center), self._radius)
 
-    def to_fits_metadata(self, metadata: MutableMapping[str, Any]) -> None:
+    def to_fits_metadata(self) -> astropy.io.fits.Header:
         # Docstring inherited.
-        metadata["ST_TYPE"] = "CIRCLE"
-        metadata["ST_RA"] = self._center.getLon().asDegrees()
-        metadata["ST_DEC"] = self._center.getLat().asDegrees()
-        metadata["ST_RAD"] = self._radius.asDegrees()
+        header = astropy.io.fits.Header()
+        header.set("ST_TYPE", "CIRCLE", "Type of stencil used to create this cutout")
+        header.set("ST_RA", self._center.getLon().asDegrees(), "[deg] Circle center Right Ascension")
+        header.set("ST_DEC", self._center.getLat().asDegrees(), "[deg] Circle center Declination")
+        header.set("ST_RAD", self._radius.asDegrees(), "[deg] Circle radius")
+        return header
 
     @property
     def fingerprint(self) -> bytes:
@@ -525,16 +531,18 @@ class SkyPolygon(SkyStencil):
         # Docstring inherited.
         return lsst.sphgeom.ConvexPolygon([UnitVector3d(v) for v in self._vertices])
 
-    def to_fits_metadata(self, metadata: MutableMapping[str, Any]) -> None:
+    def to_fits_metadata(self) -> astropy.io.fits.Header:
         # Docstring inherited.
-        metadata["ST_TYPE"] = "POLYGON"
+        header = astropy.io.fits.Header()
+        header.set("ST_TYPE", "POLYGON", "Type of stencil used to create this cutout")
         if len(self._vertices) > 100:
             raise NotImplementedError(
                 "TODO: FITS limitations make it difficult to serialize big stencils to the header."
             )
         for n, v in enumerate(self._vertices):
-            metadata[f"ST_RA{n:02d}"] = v.getLon().asDegrees()
-            metadata[f"ST_DEC{n:02d}"] = v.getLat().asDegrees()
+            header.set(f"ST_RA{n:02d}", v.getLon().asDegrees(), f"[deg] Vertex {n} Right Ascension")
+            header.set(f"ST_DEC{n:02d}", v.getLat().asDegrees(), f"[deg] Vertex {n} Declination")
+        return header
 
     @property
     def fingerprint(self) -> bytes:

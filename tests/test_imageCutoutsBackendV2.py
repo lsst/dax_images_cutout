@@ -143,7 +143,18 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
         """Cutout provenance must land in the primary FITS header for every
         cutout mode, including the native ``lsst.images`` container modes.
         """
-        provenance_keys = ("BTLRUUID", "BTLRNAME", "DATE-CUT", "CUTVERS")
+        provenance_keys = ("CUTVERS",)
+        # Card comments that fit within the 80-column FITS card limit and so
+        # survive the round trip, covering both the provenance keys (DATE-CUT)
+        # and the stencil keys (ST_TYPE).  Some cards can potentially have
+        # truncated comments.
+        provenance_comments = {
+            "BTLRUUID": "Butler UUID of full image",
+            "BTLRNAME": "Butler dataset type",
+            "ST_TYPE": "Type of stencil used to create this cutout",
+            "ST_RA": "[deg] Circle center Right Ascension",
+            "DATE-CUT": "Time of cutout extraction",
+        }
 
         with tempfile.TemporaryDirectory() as tempdir:
             cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinders[0], tempdir)
@@ -160,6 +171,12 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
                         )
                     self.assertEqual(header["BTLRUUID"], self.ref.id.hex)
                     self.assertEqual(header["BTLRNAME"], self.ref.datasetType.name)
+                    for key, comment in provenance_comments.items():
+                        self.assertEqual(
+                            header.comments[key],
+                            comment,
+                            f"{key} comment wrong in primary header for {cutout_mode}",
+                        )
 
 
 if __name__ == "__main__":

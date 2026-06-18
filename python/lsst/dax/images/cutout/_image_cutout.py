@@ -73,6 +73,18 @@ class CutoutMode(Enum):
     ASTROPY_MASKED_IMAGE = auto()
 
 
+def _property_list_from_header(header: astropy.io.fits.Header) -> PropertyList:
+    """Convert an `astropy.io.fits.Header` to a `~lsst.daf.base.PropertyList`,
+    preserving each card's comment.
+    """
+    from lsst.daf.base import PropertyList
+
+    metadata = PropertyList()
+    for card in header.cards:
+        metadata.set(card.keyword, card.value, card.comment)
+    return metadata
+
+
 @dataclasses.dataclass
 class Extraction:
     """A struct that aggregates the results of extracting subimages in the
@@ -91,11 +103,11 @@ class Extraction:
     """A pixel-coordinate representation of the stencil.
     """
 
-    metadata: PropertyList
-    """Additional FITS metadata about the cutout process.
+    metadata: astropy.io.fits.Header
+    """Provenance FITS header cards describing the cutout process.
 
-    This should be merged with ``cutout.getMetadata()`` on write, for types
-    that carry their own metadata.
+    Written to the primary header on output.  For afw cutout types it is
+    converted to a `~lsst.daf.base.PropertyList` first.
     """
 
     origin_ref: DatasetRef
@@ -174,15 +186,16 @@ class Extraction:
         with time_this(logger, msg="Writing FITS file to %s", args=(path,), level=_TIMER_LOG_LEVEL):
             if isinstance(self.cutout, lsst.images.GeneralizedImage):
                 # Write the cutout provenance into the primary FITS header via
-                # the archive's update_header hook.  Storing it in the object's
-                # flexible metadata would instead place it in the JSON tree,
-                # where it would not appear in the primary header.
+                # the archive's update_header hook.  ``metadata`` is an astropy
+                # Header, so card comments are preserved.  Storing it in the
+                # object's flexible metadata would instead place it in the JSON
+                # tree, where it would not appear in the primary header.
                 self.cutout.write(path, update_header=lambda header: header.update(self.metadata))
             elif hasattr(self.cutout, "getMetadata") and hasattr(self.cutout, "writeFits"):
-                self.cutout.metadata.update(self.metadata)
+                self.cutout.metadata.update(_property_list_from_header(self.metadata))
                 self.cutout.writeFits(path)
             else:
-                self.cutout.writeFits(path, metadata=self.metadata)
+                self.cutout.writeFits(path, metadata=_property_list_from_header(self.metadata))
 
 
 class ImageCutoutFactory:
@@ -517,10 +530,8 @@ class ImageCutoutFactory:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
-        # We know that afw and daf_base are available here since we received
-        # an afw Exposure.
+        # We know that afw is available here since we received an afw Exposure.
         from lsst.afw.image import makeExposure, makeMaskedImage
-        from lsst.daf.base import PropertyList
 
         if ref.id is None:
             raise ValueError(f"A resolved DatasetRef is required; got {ref}.")
@@ -594,13 +605,8 @@ class ImageCutoutFactory:
                 case _:
                     raise ValueError(f"Unsupported cutout mode: {cutout_mode}")
 
-        # Create some FITS metadata with the cutout parameters.
-        provenance_metadata = self._record_cutout_provenance(ref, now, stencil, timesys)
-
-        # Store in PropertyList since that is needed for legacy but might
-        # confuse Astropy lsst.images types.
-        metadata = PropertyList()
-        metadata.update(provenance_metadata)
+        # Create the provenance header with the cutout parameters.
+        metadata = self._record_cutout_provenance(ref, now, stencil, timesys)
 
         # Every supported cutout mode produces a pixel stencil above.
         assert pixel_stencil is not None
@@ -645,8 +651,6 @@ class ImageCutoutFactory:
         # There are two distinct modes of operation. One is using the native
         # lsst.images interface, the other is using Astropy to deal with
         # IMAGE and MASKED_IMAGE by using standard FITS conventions.
-
-        metadata: dict[str, str | int] = {}
         if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
             # To reduce round-trips to an object store we want to open the file
             # once and then read out the components we need. In theory we can
@@ -714,28 +718,28 @@ class ImageCutoutFactory:
 
     def _record_cutout_provenance(
         self, ref: DatasetRef, start_time: astropy.time.Time, stencil: SkyStencil, timesys: str
-    ) -> dict[str, str | int]:
-        metadata = {}
+    ) -> astropy.io.fits.Header:
+        header = astropy.io.fits.Header()
 
         # Create some FITS metadata with the cutout parameters.
         # Some of these are added as provenance by the butler on write so may
         # no longer be necessary.
-        metadata["BTLRUUID"] = ref.id.hex
-        metadata["BTLRNAME"] = ref.datasetType.name
+        header.set("BTLRUUID", ref.id.hex, "Butler UUID of full image")
+        header.set("BTLRNAME", ref.datasetType.name, "Butler dataset type")
         for n, (k, v) in enumerate(ref.dataId.required.items()):
             # Write data ID dictionary sort of like a list of 2-tuples, to make
             # it easier to stay within the FITS 8-char key limit.
-            metadata[f"BTLRK{n:03}"] = k
-            metadata[f"BTLRV{n:03}"] = v
-        stencil.to_fits_metadata(metadata)
+            header.set(f"BTLRK{n:03}", k, f"Name of dimension {n} in the data ID")
+            header.set(f"BTLRV{n:03}", v, f"Value of dimension {n} in the data ID")
+        header.extend(stencil.to_fits_metadata())
 
         # Record the time and software version.
         start_time.format = "fits"
         start_time = start_time.tai if timesys.lower() == "tai" else start_time.utc
-        metadata["DATE-CUT"] = str(start_time)
-        metadata["CUTVERS"] = __version__
+        header.set("DATE-CUT", str(start_time), "Time of cutout extraction")
+        header.set("CUTVERS", __version__, "dax_images_cutout software version")
 
-        return metadata
+        return header
 
     def extract_uuid(
         self,
