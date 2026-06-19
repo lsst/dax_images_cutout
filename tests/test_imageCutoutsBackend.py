@@ -85,7 +85,11 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
                     case lsst.afw.image.Image():
                         array = result.cutout.array
                         box = result.cutout.getBBox()
-                    case lsst.images.GeneralizedImage():
+                    case lsst.images.MaskedImage():
+                        box = result.cutout.bbox.to_legacy()
+                        array = result.cutout.image.array
+                    case lsst.images.Image():
+                        array = result.cutout.array
                         box = result.cutout.bbox.to_legacy()
                     case _:
                         raise RuntimeError(f"Unexpected cutout type: {type(result.cutout)}")
