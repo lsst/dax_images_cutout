@@ -76,11 +76,6 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
                 case lsst.images.Image():
                     array = result.cutout.array
                     box = result.cutout.bbox
-                case astropy.io.fits.HDUList():
-                    hdu = result.cutout[1]
-                    array = hdu.data
-                    # Only checks the shape.
-                    box = lsst.images.Box.factory[1 : hdu.shape[0] + 1, 1 : hdu.shape[1] + 1]
                 case _:
                     raise RuntimeError(f"Unexpected cutout type: {type(result.cutout)}")
 
