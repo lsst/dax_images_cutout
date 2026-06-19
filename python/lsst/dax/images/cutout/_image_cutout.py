@@ -38,7 +38,7 @@ import lsst.images.serialization
 from lsst.daf.butler import Butler, DataId, DatasetRef
 from lsst.images import Box, MaskPlane, MaskSchema
 from lsst.images import Mask as ImagesMask
-from lsst.images.fits import DEFAULT_PAGE_SIZE, READ_CACHE_MAX_BYTES, ExtensionKey
+from lsst.images.fits import DEFAULT_PAGE_SIZE, READ_CACHE_MAX_BYTES, ExtensionKey, FitsOpaqueMetadata
 from lsst.images.fits._input_archive import _READ_CACHE_TYPE
 from lsst.resources import ResourcePath, ResourcePathExpression
 from lsst.utils.timer import time_this
@@ -135,6 +135,7 @@ class Extraction:
             if name not in mask.schema.names:
                 mask.add_plane(name, "Pixel lies outside the stencil")
             self.pixel_stencil.set_mask(mask, name, covered=False)
+            self._record_legacy_mask_plane(self.cutout, name)
             return
 
         # Try afw variants. Protect the imports (if the imports fail it is
@@ -164,6 +165,56 @@ class Extraction:
         mask.addMaskPlane(name)
         bits = mask.getPlaneBitMask(name)
         mask.array[:, :] |= (bits * outside).astype(mask.array.dtype)
+
+    def _record_legacy_mask_plane(self, masked_image: lsst.images.MaskedImage, name: str) -> None:
+        """Add an ``MP_`` card for a newly added mask plane if the cutout came
+        from a legacy afw file.
+
+        Parameters
+        ----------
+        masked_image : `lsst.images.MaskedImage`
+            The cutout whose mask just gained the ``name`` plane.
+        name : `str`
+            Name of the mask plane just added to ``masked_image.mask``.
+
+        Notes
+        -----
+        ``MaskedImage.from_hdu_list`` keeps the legacy ``MP_*`` mask-plane
+        cards (re-indexed to the reshuffled schema) in the ``MASK`` opaque
+        metadata so ``lsst.afw.image`` can still read the inherited planes.  A
+        plane added afterwards (e.g. ``OUTSIDE_STENCIL``) is only described by
+        the native ``MSKN`` cards, which afw does not understand, so afw would
+        not see it.  When the cutout carries that legacy provenance, record a
+        matching ``MP_`` card for the new plane at the bit it occupies in the
+        serialized (single-element) schema, so the whole cutout mask stays
+        readable by legacy tooling.  Files without legacy ``MP_`` cards are
+        left untouched.
+
+        Reaching into ``_opaque_metadata`` mirrors how the cutout's ``TIMESYS``
+        is recovered elsewhere in this module.
+        """
+        opaque = masked_image._opaque_metadata
+        if not isinstance(opaque, FitsOpaqueMetadata):
+            return
+        key = ExtensionKey("MASK")
+        mask_header = opaque.headers.get(key)
+        if mask_header is None or not any(keyword.startswith("MP_") for keyword in mask_header):
+            return
+        # The serialized form packs every plane into one element, so a plane's
+        # bit index is its position among the non-placeholder planes.
+        serialized_bit = 0
+        for plane in masked_image.mask.schema:
+            if plane is None:
+                continue
+            if plane.name == name:
+                break
+            serialized_bit += 1
+        else:
+            return
+        # Opaque headers are treated as immutable, so replace, don't mutate.
+        updated = mask_header.copy()
+        updated[f"MP_{name}"] = serialized_bit
+        opaque.headers[key] = updated
 
     def write_fits(self, path: str, logger: logging.Logger | None = None) -> None:
         """Write the cutout to a FITS file.

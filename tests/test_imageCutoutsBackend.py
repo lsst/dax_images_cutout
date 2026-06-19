@@ -24,6 +24,7 @@ import tempfile
 import unittest
 
 import astropy
+import numpy as np
 
 import lsst.daf.butler
 import lsst.images
@@ -146,6 +147,39 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
                     # IMAGE only reads the second header without merging
                     if cutout_mode != CutoutMode.IMAGE_ONLY:
                         self.assertIn("BGMEAN", header)
+
+    def test_astropy_masked_image_planes_readable_by_afw(self):
+        """The ``ASTROPY_MASKED_IMAGE`` backend re-serializes the cutout as an
+        ``lsst.images`` file but keeps the legacy ``MP_`` mask-plane cards
+        (re-indexed to the reshuffled schema).  ``lsst.afw.image`` can
+        therefore read the cutout, and each mask plane covers the same pixels
+        as the afw-only ``MASKED_IMAGE`` backend even though the bit numbering
+        may differ between the two.
+        """
+        with tempfile.TemporaryDirectory() as tempdir:
+            cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinders[0], tempdir)
+            astropy_uri = cutoutBackend.process_ref(
+                self.stencil, self.ref, cutout_mode=CutoutMode.ASTROPY_MASKED_IMAGE
+            )
+            afw_uri = cutoutBackend.process_ref(self.stencil, self.ref, cutout_mode=CutoutMode.MASKED_IMAGE)
+            # Both files are read back through afw; the astropy cutout is an
+            # lsst.images file, so this exercises afw reading the re-indexed
+            # MP_ cards.
+            astropy_mask = lsst.afw.image.MaskedImageF(astropy_uri.ospath).mask
+            afw_mask = lsst.afw.image.MaskedImageF(afw_uri.ospath).mask
+
+        common_planes = set(astropy_mask.getMaskPlaneDict()) & set(afw_mask.getMaskPlaneDict())
+        self.assertTrue(common_planes, "afw read no shared mask planes from the astropy cutout")
+
+        any_set = False
+        for plane in sorted(common_planes):
+            astropy_set = (astropy_mask.array & astropy_mask.getPlaneBitMask(plane)) != 0
+            afw_set = (afw_mask.array & afw_mask.getPlaneBitMask(plane)) != 0
+            np.testing.assert_array_equal(
+                astropy_set, afw_set, err_msg=f"mask plane {plane!r} coverage differs"
+            )
+            any_set = any_set or bool(afw_set.any())
+        self.assertTrue(any_set, "expected at least one mask plane to be set in the cutout")
 
 
 if __name__ == "__main__":
