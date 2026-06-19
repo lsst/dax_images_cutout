@@ -23,7 +23,7 @@ import os.path
 import tempfile
 import unittest
 
-import astropy
+import astropy.io.fits
 import numpy as np
 
 import lsst.daf.butler
