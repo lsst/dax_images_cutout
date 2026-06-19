@@ -139,7 +139,7 @@ class Extraction:
             return
 
         # Try afw variants. Protect the imports (if the imports fail it is
-        # not possible for it to be an afe type).
+        # not possible for it to be an afw type).
         try:
             from lsst.afw.image import Exposure, Mask, MaskedImage
 
@@ -260,8 +260,7 @@ class ImageCutoutFactory:
         Object that obtains the WCS and bounding box for butler datasets of
         different types.  May include caches.
     output_root : convertible to `ResourcePath`
-        Root of output file URIs.  This will be combined with the originating
-        dataset's UUID and an encoding of the stencil to form the complete URI.
+        Root of output file URIs.
     temporary_root : convertible to `ResourcePath`, optional
         Local filesystem root to write files to before they are transferred to
         ``output_root`` (passed as the prefix argument to
@@ -734,7 +733,7 @@ class ImageCutoutFactory:
                             cutout = reader.get_component("image", bbox=modern_bbox)
                         case CutoutMode.MASKED_IMAGE | CutoutMode.STRIPPED_EXPOSURE:
                             # A Stripped exposure is meaningless with the
-                            # new models since MaskedImage does now carry a
+                            # new models since MaskedImage now carries a
                             # WCS and metadata.
                             cutout = reader.get_component("masked_image", bbox=modern_bbox)
                         case _:
