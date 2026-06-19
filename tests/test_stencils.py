@@ -308,7 +308,7 @@ class StencilContainmentTestCase(unittest.TestCase):
     def test_clip_true_unchanged_when_contained(self) -> None:
         # A fully contained stencil keeps its tight bbox even when clipping.
         for backend, tolerance in self.BACKEND_TOLERANCE.items():
-            with self.subTest(backend=backend):
+            with self.subTest(backend=str(backend)):
                 _check_to_pixel(
                     self,
                     self._circle(clip=True),
@@ -322,7 +322,7 @@ class StencilContainmentTestCase(unittest.TestCase):
 
     def test_clip_true_clips_to_intersection_on_partial_overlap(self) -> None:
         for backend, tolerance in self.BACKEND_TOLERANCE.items():
-            with self.subTest(backend=backend):
+            with self.subTest(backend=str(backend)):
                 _check_to_pixel(
                     self,
                     self._circle(clip=True),
@@ -336,7 +336,7 @@ class StencilContainmentTestCase(unittest.TestCase):
 
     def test_clip_true_clips_to_box_when_box_inside_stencil(self) -> None:
         for backend, tolerance in self.BACKEND_TOLERANCE.items():
-            with self.subTest(backend=backend):
+            with self.subTest(backend=str(backend)):
                 _check_to_pixel(
                     self,
                     self._circle(clip=True),

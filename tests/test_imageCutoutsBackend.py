@@ -121,7 +121,7 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinders[0], tempdir)
             for cutout_mode in CutoutMode:
-                with self.subTest(cutout_mode=cutout_mode):
+                with self.subTest(cutout_mode=str(cutout_mode)):
                     output = cutoutBackend.process_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
                     with output.open("rb") as fh, astropy.io.fits.open(fh) as hdul:
                         header = hdul[0].header
