@@ -46,6 +46,9 @@ zip-safe = true
 [tool.setuptools.dynamic]
 version = { attr = "lsst_versions.get_lsst_version" }
 
+[tool.setuptools.package-data]
+"lsst.dax.images.cutout" = ["py.typed"]
+
 [tool.lsst_versions]
 write_to = "python/lsst/dax/images/cutout/version.py"
 
