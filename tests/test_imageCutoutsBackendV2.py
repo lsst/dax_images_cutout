@@ -92,6 +92,36 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
                 self.assertFloatsAlmostEqual(array[1, 1], 7.183607578277588)
                 self.assertFloatsAlmostEqual(array[27, 28], -11.042882919311523)
 
+    def test_outside_stencil_mask(self) -> None:
+        """The ``OUTSIDE_STENCIL`` plane masks exactly the pixels outside the
+        circular stencil for every mask-bearing cutout mode.
+
+        The image-only modes carry no mask and are exempt.  The expected count
+        is fixed by the stencil geometry and the test data WCS: it is the
+        circle's complement within the ``29 x 28`` bounding box, so it is a
+        non-empty, non-full subset (which also guards against an inverted
+        mask).  It will change if the stencil or the fuzzed WCS changes.
+        """
+        image_only_modes = {CutoutMode.IMAGE_ONLY, CutoutMode.ASTROPY_IMAGE}
+        expected_outside = 195
+        for cutout_mode in CutoutMode:
+            with self.subTest(cutout_mode=str(cutout_mode)):
+                cutoutBackend = ImageCutoutFactory(self.butler, self.projectionFinders[0], ".")
+                result = cutoutBackend.extract_ref(self.stencil, self.ref, cutout_mode=cutout_mode)
+                result.mask()
+                if cutout_mode in image_only_modes:
+                    self.assertIsInstance(result.cutout, lsst.images.Image)
+                    continue
+                mask = result.cutout.mask
+                self.assertIn("OUTSIDE_STENCIL", mask.schema.names)
+                outside = mask.get("OUTSIDE_STENCIL")
+                total = result.cutout.bbox.x.size * result.cutout.bbox.y.size
+                n_outside = int(outside.sum())
+                # A real circle complement: neither empty nor the full box.
+                self.assertGreater(n_outside, 0)
+                self.assertLess(n_outside, total)
+                self.assertEqual(n_outside, expected_outside)
+
     def test_off_edge_cutout(self) -> None:
         """Test that we get a truncated cutout at the edge of the image."""
         # Shift the default position slightly so we fall partly off the edge.
