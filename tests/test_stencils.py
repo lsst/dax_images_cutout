@@ -35,7 +35,6 @@ from lsst.dax.images.cutout.stencils import (
     SkyCircle,
     SkyStencil,
     StencilNotContainedError,
-    _round_box_from_bounds,
 )
 from lsst.images import Box, GeneralFrame, Mask, MaskPlane, MaskSchema, SkyProjection
 from lsst.sphgeom import Angle, LonLat, UnitVector3d  # noqa: F401  (used by eval(repr))
@@ -68,11 +67,6 @@ def _make_wcs() -> astropy.wcs.WCS:
 
 class ModuleHelpersTestCase(unittest.TestCase):
     """Tests for module-level helpers that survive the rewrite."""
-
-    def test_round_box_from_bounds(self) -> None:
-        # x in [4.6, 9.4], y in [2.6, 5.4] -> box [3:6, 5:10] in [y, x].
-        box = _round_box_from_bounds(4.6, 9.4, 2.6, 5.4)
-        self.assertEqual(box, Box.factory[3:6, 5:10])
 
     def test_mask_backend_members(self) -> None:
         self.assertEqual({b.name for b in MaskBackend}, {"AST", "SPHGEOM"})

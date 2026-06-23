@@ -45,7 +45,6 @@ from astropy.coordinates import SkyCoord
 
 import lsst.sphgeom
 from lsst.images import Box, Mask, NoOverlapError, SkyProjection
-from lsst.images.utils import round_half_down, round_half_up
 from lsst.sphgeom import Angle, LonLat, UnitVector3d
 
 
@@ -57,18 +56,6 @@ class MaskBackend(enum.Enum):
 
     SPHGEOM = enum.auto()
     """Mask by testing pixel centers against the ``lsst.sphgeom`` region."""
-
-
-def _round_box_from_bounds(x_min: float, x_max: float, y_min: float, y_max: float) -> Box:
-    """Build an integer pixel `Box` from continuous coordinate bounds.
-
-    Uses the same rounding convention as `lsst.images.Region.bbox`, so that
-    pixels whose centers lie within the bounds are included.
-    """
-    return Box.factory[
-        round_half_up(y_min) : round_half_down(y_max) + 1,
-        round_half_up(x_min) : round_half_down(x_max) + 1,
-    ]
 
 
 def _skycoord_from_lonlat(lonlat: LonLat) -> SkyCoord:
@@ -275,8 +262,11 @@ class SkyStencil(ABC):
         mask backends share an identical bounding box.
         """
         xy = projection.sky_to_pixel(self._boundary_skycoord())
-        return _round_box_from_bounds(
-            float(np.min(xy.x)), float(np.max(xy.x)), float(np.min(xy.y)), float(np.max(xy.y))
+        return Box.from_float_bounds(
+            x_min=float(np.min(xy.x)),
+            x_max=float(np.max(xy.x)),
+            y_min=float(np.min(xy.y)),
+            y_max=float(np.max(xy.y)),
         )
 
     def _resolve_box(self, tight: Box, box: Box) -> Box:
