@@ -27,22 +27,31 @@ import dataclasses
 import logging
 from collections.abc import Sequence
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import astropy.io.fits
 import astropy.time
 
-import lsst.geom
-from lsst.afw.geom import getImageXY0FromMetadata, makeSkyWcs
-from lsst.afw.image import Exposure, Image, Mask, MaskedImage, makeExposure, makeMaskedImage
-from lsst.daf.base import PropertyList
+import lsst.images
+import lsst.images.serialization
 from lsst.daf.butler import Butler, DataId, DatasetRef
+from lsst.images import Box, MaskPlane, MaskSchema
+from lsst.images import Mask as ImagesMask
+from lsst.images.fits import DEFAULT_PAGE_SIZE, READ_CACHE_MAX_BYTES, ExtensionKey, FitsOpaqueMetadata
+from lsst.images.fits._input_archive import _READ_CACHE_TYPE
 from lsst.resources import ResourcePath, ResourcePathExpression
 from lsst.utils.timer import time_this
 
+from ._fits_projection import projection_and_bbox_from_fits_header
 from .projection_finders import ProjectionFinder
 from .stencils import PixelStencil, SkyStencil
 from .version import __version__
+
+if TYPE_CHECKING:
+    from lsst.afw.image import Exposure, Image, Mask, MaskedImage
+    from lsst.daf.base import PropertyList
+
 
 # Default logger.
 _LOG = logging.getLogger(__name__)
@@ -64,13 +73,25 @@ class CutoutMode(Enum):
     ASTROPY_MASKED_IMAGE = auto()
 
 
+def _property_list_from_header(header: astropy.io.fits.Header) -> PropertyList:
+    """Convert an `astropy.io.fits.Header` to a `~lsst.daf.base.PropertyList`,
+    preserving each card's comment.
+    """
+    from lsst.daf.base import PropertyList
+
+    metadata = PropertyList()
+    for card in header.cards:
+        metadata.set(card.keyword, card.value, card.comment)
+    return metadata
+
+
 @dataclasses.dataclass
 class Extraction:
     """A struct that aggregates the results of extracting subimages in the
     image cutout backend.
     """
 
-    cutout: Image | Mask | MaskedImage | Exposure | astropy.io.fits.HDUList
+    cutout: Image | Mask | MaskedImage | Exposure | lsst.images.GeneralizedImage
     """The image cutout itself.
     """
 
@@ -82,18 +103,18 @@ class Extraction:
     """A pixel-coordinate representation of the stencil.
     """
 
-    metadata: PropertyList
-    """Additional FITS metadata about the cutout process.
+    metadata: astropy.io.fits.Header
+    """Provenance FITS header cards describing the cutout process.
 
-    This should be merged with ``cutout.getMetadata()`` on write, for types
-    that carry their own metadata.
+    Written to the primary header on output.  For afw cutout types it is
+    converted to a `~lsst.daf.base.PropertyList` first.
     """
 
     origin_ref: DatasetRef
     """Fully-resolved reference to the dataset the cutout is from.
     """
 
-    def mask(self, name: str = "STENCIL") -> None:
+    def mask(self, name: str = "OUTSIDE_STENCIL") -> None:
         """Set the bitmask to show the approximate coverage of nonrectangular
         stencils.
 
@@ -108,17 +129,94 @@ class Extraction:
         `MaskedImage`, or `Exposure`.  It does nothing if `cutout` is an
         `Image`.
         """
-        if isinstance(self.cutout, Exposure):
+        if isinstance(self.cutout, lsst.images.MaskedImage):
             mask = self.cutout.mask
-        elif isinstance(self.cutout, MaskedImage):
-            mask = self.cutout.mask
-        elif isinstance(self.cutout, Mask):
-            mask = self.cutout
-        else:
+            # Create the new plane if it's not there.
+            if name not in mask.schema.names:
+                # Adding a plane creates a whole new mask.
+                mask = mask.add_plane(name, "Pixel lies outside the stencil")
+                self.cutout.mask = mask
+            self.pixel_stencil.set_mask(mask, name, covered=False)
+            self._record_legacy_mask_plane(self.cutout, name)
             return
+
+        # Try afw variants. Protect the imports (if the imports fail it is
+        # not possible for it to be an afw type).
+        try:
+            from lsst.afw.image import Exposure, Mask, MaskedImage
+
+            match self.cutout:
+                case Exposure() | MaskedImage():
+                    mask = self.cutout.mask
+                case Mask():
+                    mask = self.cutout
+                case _:
+                    return
+        except ImportError:
+            # Can not determine the type so do not mask anything.
+            return
+
+        # Stage the coverage in an lsst.images.Mask, then OR it into the afw
+        # mask plane so stencils never sees an afw object.
+        images_mask = ImagesMask(
+            schema=MaskSchema([MaskPlane(name, "Pixel lies outside the stencil")]),
+            bbox=Box.from_legacy(mask.getBBox()),
+        )
+        self.pixel_stencil.set_mask(images_mask, name, covered=False)
+        outside = images_mask.get(name)
         mask.addMaskPlane(name)
         bits = mask.getPlaneBitMask(name)
-        self.pixel_stencil.set_mask(mask, bits)
+        mask.array[:, :] |= (bits * outside).astype(mask.array.dtype)
+
+    def _record_legacy_mask_plane(self, masked_image: lsst.images.MaskedImage, name: str) -> None:
+        """Add an ``MP_`` card for a newly added mask plane if the cutout came
+        from a legacy afw file.
+
+        Parameters
+        ----------
+        masked_image : `lsst.images.MaskedImage`
+            The cutout whose mask just gained the ``name`` plane.
+        name : `str`
+            Name of the mask plane just added to ``masked_image.mask``.
+
+        Notes
+        -----
+        ``MaskedImage.from_hdu_list`` keeps the legacy ``MP_*`` mask-plane
+        cards (re-indexed to the reshuffled schema) in the ``MASK`` opaque
+        metadata so ``lsst.afw.image`` can still read the inherited planes.  A
+        plane added afterwards (e.g. ``OUTSIDE_STENCIL``) is only described by
+        the native ``MSKN`` cards, which afw does not understand, so afw would
+        not see it.  When the cutout carries that legacy provenance, record a
+        matching ``MP_`` card for the new plane at the bit it occupies in the
+        serialized (single-element) schema, so the whole cutout mask stays
+        readable by legacy tooling.  Files without legacy ``MP_`` cards are
+        left untouched.
+
+        Reaching into ``_opaque_metadata`` mirrors how the cutout's ``TIMESYS``
+        is recovered elsewhere in this module.
+        """
+        opaque = masked_image._opaque_metadata
+        if not isinstance(opaque, FitsOpaqueMetadata):
+            return
+        key = ExtensionKey("MASK")
+        mask_header = opaque.headers.get(key)
+        if mask_header is None or not any(keyword.startswith("MP_") for keyword in mask_header):
+            return
+        # The serialized form packs every plane into one element, so a plane's
+        # bit index is its position among the non-placeholder planes.
+        serialized_bit = 0
+        for plane in masked_image.mask.schema:
+            if plane is None:
+                continue
+            if plane.name == name:
+                break
+            serialized_bit += 1
+        else:
+            return
+        # Opaque headers are treated as immutable, so replace, don't mutate.
+        updated = mask_header.copy()
+        updated[f"MP_{name}"] = serialized_bit
+        opaque.headers[key] = updated
 
     def write_fits(self, path: str, logger: logging.Logger | None = None) -> None:
         """Write the cutout to a FITS file.
@@ -139,15 +237,18 @@ class Extraction:
         """
         logger = logger if logger is not None else _LOG
         with time_this(logger, msg="Writing FITS file to %s", args=(path,), level=_TIMER_LOG_LEVEL):
-            if isinstance(self.cutout, Exposure):
-                self.cutout.getMetadata().update(self.metadata)
+            if isinstance(self.cutout, lsst.images.GeneralizedImage):
+                # Write the cutout provenance into the primary FITS header via
+                # the archive's update_header hook.  ``metadata`` is an astropy
+                # Header, so card comments are preserved.  Storing it in the
+                # object's flexible metadata would instead place it in the JSON
+                # tree, where it would not appear in the primary header.
+                self.cutout.write(path, update_header=lambda header: header.update(self.metadata))
+            elif hasattr(self.cutout, "getMetadata") and hasattr(self.cutout, "writeFits"):
+                self.cutout.metadata.update(_property_list_from_header(self.metadata))
                 self.cutout.writeFits(path)
-            elif isinstance(self.cutout, astropy.io.fits.HDUList):
-                self.cutout[0].header.update(self.metadata)
-                with open(path, "wb") as fh:
-                    self.cutout.writeto(fh)
             else:
-                self.cutout.writeFits(path, metadata=self.metadata)
+                self.cutout.writeFits(path, metadata=_property_list_from_header(self.metadata))
 
 
 class ImageCutoutFactory:
@@ -161,8 +262,7 @@ class ImageCutoutFactory:
         Object that obtains the WCS and bounding box for butler datasets of
         different types.  May include caches.
     output_root : convertible to `ResourcePath`
-        Root of output file URIs.  This will be combined with the originating
-        dataset's UUID and an encoding of the stencil to form the complete URI.
+        Root of output file URIs.
     temporary_root : convertible to `ResourcePath`, optional
         Local filesystem root to write files to before they are transferred to
         ``output_root`` (passed as the prefix argument to
@@ -211,7 +311,7 @@ class ImageCutoutFactory:
         stencil: SkyStencil,
         ref: DatasetRef,
         *,
-        mask_plane: str | None = "STENCIL",
+        mask_plane: str | None = "OUTSIDE_STENCIL",
         cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE,
     ) -> ResourcePath:
         """Extract and write a cutout from a fully-resolved `DatasetRef`.
@@ -225,10 +325,11 @@ class ImageCutoutFactory:
             Must have ``DatasetRef.id`` not `None` (use `extract_search`
             instead when this is not the case).  Need not have an expanded data
             ID.  May represent an image-like dataset component.
-        mask : `str`, optional
-            If not `None`, set this mask plane in the extracted cutout showing
-            the approximate stencil region.  Does nothing if the image type
-            does not have a mask plane.  Defaults to ``STENCIL``.
+        mask_plane : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout to flag
+            pixels that lie outside the stencil region.  Does nothing if the
+            image type does not have a mask plane.  Defaults to
+            ``OUTSIDE_STENCIL``.
 
         Returns
         -------
@@ -246,7 +347,7 @@ class ImageCutoutFactory:
         uuid: UUID,
         *,
         component: str | None = None,
-        mask_plane: str | None = "STENCIL",
+        mask_plane: str | None = "OUTSIDE_STENCIL",
         cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE,
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by its UUID.
@@ -260,10 +361,11 @@ class ImageCutoutFactory:
         component : `str`, optional
             If not `None` (default), read this component instead of the
             composite dataset.
-        mask : `str`, optional
-            If not `None`, set this mask plane in the extracted cutout showing
-            the approximate stencil region.  Does nothing if the image type
-            does not have a mask plane.  Defaults to ``STENCIL``.
+        mask_plane : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout to flag
+            pixels that lie outside the stencil region.  Does nothing if the
+            image type does not have a mask plane.  Defaults to
+            ``OUTSIDE_STENCIL``.
 
         Returns
         -------
@@ -282,7 +384,7 @@ class ImageCutoutFactory:
         data_id: DataId,
         collections: Sequence[str],
         *,
-        mask_plane: str | None = "STENCIL",
+        mask_plane: str | None = "OUTSIDE_STENCIL",
     ) -> ResourcePath:
         """Extract and write a cutout from a dataset identified by a
         (dataset type, data ID, collection path) tuple.
@@ -300,10 +402,11 @@ class ImageCutoutFactory:
         collections : `Iterable` [ `str` ]
             Collections to search for the dataset, in the order they should be
             searched.
-        mask : `str`, optional
-            If not `None`, set this mask plane in the extracted cutout showing
-            the approximate stencil region.  Does nothing if the image type
-            does not have a mask plane.  Defaults to ``STENCIL``.
+        mask_plane : `str`, optional
+            If not `None`, set this mask plane in the extracted cutout to flag
+            pixels that lie outside the stencil region.  Does nothing if the
+            image type does not have a mask plane.  Defaults to
+            ``OUTSIDE_STENCIL``.
 
         Returns
         -------
@@ -337,6 +440,151 @@ class ImageCutoutFactory:
             and the pixel-coordinate stencil.  The cutout is not masked;
             `Extraction.mask` must be called explicitly if desired.
         """
+        if issubclass(ref.datasetType.storageClass.pytype, lsst.images.GeneralizedImage):
+            return self._extract_ref_v2(stencil, ref, cutout_mode=cutout_mode)
+        return self._extract_ref_legacy(stencil, ref, cutout_mode=cutout_mode)
+
+    def _read_astropy_hdulist(
+        self,
+        cutout_mode: CutoutMode,
+        stencil: SkyStencil,
+        ref: DatasetRef,
+    ) -> tuple[lsst.images.GeneralizedImage, PixelStencil | None, str]:
+        """Read the primary header and pixel HDUs, cut to the stencil.
+
+        Parameters
+        ----------
+        cutout_mode
+            The requested cutout mode. Must be either an Astropy image or
+            masked image request.
+        stencil
+            Sky-coordinate stencil defining the cutout region.
+        ref : `DatasetRef`
+            Resolved reference to the dataset to read.
+
+        Returns
+        -------
+        result : `lsst.images.GeneralizedImage`
+            The resultant generalized image constructed from the individual
+            HDUs.
+        pixel_stencil : `PixelStencil` or `None`
+            Pixel-coordinate stencil computed from the first pixel HDU, or
+            `None` if no pixel HDU was found.
+        timesys : `str`
+            ``TIMESYS`` from the primary header, or ``"UTC"``.
+        """
+        if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
+            raise ValueError(f"Unexpected cutout mode {cutout_mode} encountered")
+
+        pixel_components = (
+            {"image"} if cutout_mode == CutoutMode.ASTROPY_IMAGE else {"image", "mask", "variance"}
+        )
+        # Tune the fsspec cache to match what we use in lsst.images.
+        maxblocks = max(2, READ_CACHE_MAX_BYTES // DEFAULT_PAGE_SIZE)
+        fsspec_kwargs = {
+            "block_size": DEFAULT_PAGE_SIZE,
+            "cache_type": _READ_CACHE_TYPE,
+            "cache_options": {"maxblocks": maxblocks},
+        }
+        timesys = "UTC"
+        pixel_stencil: PixelStencil | None = None
+        bbox: Box | None = None
+        uri = self.butler.getURI(ref)
+        fs, fspath = uri.to_fsspec()
+        hdul: list[astropy.io.fits.hdu.base.ExtensionHDU] = []
+        found_primary = False
+        with fs.open(fspath, **fsspec_kwargs) as f, astropy.io.fits.open(f) as fits_obj:
+            for hdu in fits_obj:
+                if not found_primary:
+                    hdul.append(hdu.copy())
+                    timesys_hdr = hdul[0].header.get("TIMESYS", timesys)
+                    if timesys_hdr:
+                        # For mypy since in theory a FITS header can exist
+                        # but be undefined.
+                        timesys = str(timesys_hdr)
+
+                    found_primary = True
+
+                    # Some old legacy data erroneously wrote "IMAGE" to the
+                    # EXTNAME of the primary header. Since we are assuming
+                    # here that the primary never has pixel data, fix the
+                    # header to prevent downstream confusion.
+                    if "EXTNAME" in hdul[0].header:
+                        del hdul[0].header["EXTNAME"]
+
+                    continue
+
+                hdr = hdu.header
+                extname = hdr.get("EXTNAME")
+                if extname and extname.lower() in pixel_components:
+                    pixel_components.remove(extname.lower())
+                    projection, full_bbox = projection_and_bbox_from_fits_header(hdr, hdu.shape)
+                    if pixel_stencil is None:
+                        pixel_stencil = stencil.to_pixels(projection, full_bbox)
+                        bbox = pixel_stencil.bbox
+
+                    assert bbox is not None
+                    # Offsets of the cutout within the full HDU (array order).
+                    min_x = bbox.x.start - full_bbox.x.start
+                    max_x = bbox.x.stop - full_bbox.x.start
+                    min_y = bbox.y.start - full_bbox.y.start
+                    max_y = bbox.y.stop - full_bbox.y.start
+                    data = hdu.section[min_y:max_y, min_x:max_x].copy()
+
+                    # Correct the header WCS for the cutout offset.
+                    if (k := "CRPIX1") in hdr:
+                        hdr[k] -= min_x
+                    if (k := "CRPIX2") in hdr:
+                        hdr[k] -= min_y
+                    if (k := "LTV1") in hdr:
+                        hdr[k] = -bbox.x.start
+                    if (k := "LTV2") in hdr:
+                        hdr[k] = -bbox.y.start
+                    if (k := "CRVAL1A") in hdr:
+                        hdr[k] = bbox.x.start
+                    if (k := "CRVAL2A") in hdr:
+                        hdr[k] = bbox.y.start
+
+                    hdul.append(astropy.io.fits.ImageHDU(data=data, header=hdr.copy()))
+
+                if not pixel_components:
+                    break
+
+        hdulist = astropy.io.fits.HDUList(hdus=hdul)
+        result: lsst.images.GeneralizedImage
+        if cutout_mode == CutoutMode.ASTROPY_IMAGE:
+            result = lsst.images.Image.from_hdu_list(hdulist)
+        else:
+            result = lsst.images.MaskedImage.from_hdu_list(hdulist)
+
+        return result, pixel_stencil, timesys
+
+    def _extract_ref_legacy(
+        self, stencil: SkyStencil, ref: DatasetRef, cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE
+    ) -> Extraction:
+        """Extract a subimage from a fully-resolved `DatasetRef` associated
+        with a legacy exposure.
+
+        Parameters
+        ----------
+        stencil : `SkyStencil`
+            Definition of the cutout region, in sky coordinates.
+        ref : `DatasetRef`
+            Fully-resolved reference to the dataset to obtain the cutout from.
+            Must have ``DatasetRef.id`` not `None` (use `extract_search`
+            instead when this is not the case).  Need not have an expanded data
+            ID.  May represent an image-like dataset component.
+
+        Returns
+        -------
+        result : `Extraction`
+            Struct that combines the cutout itself with additional metadata
+            and the pixel-coordinate stencil.  The cutout is not masked;
+            `Extraction.mask` must be called explicitly if desired.
+        """
+        # We know that afw is available here since we received an afw Exposure.
+        from lsst.afw.image import makeExposure, makeMaskedImage
+
         if ref.id is None:
             raise ValueError(f"A resolved DatasetRef is required; got {ref}.")
         # Timestamp of the cutout extraction.
@@ -347,11 +595,10 @@ class ImageCutoutFactory:
         bbox = None
         pixel_stencil = None
         if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
-            wcs, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
+            projection, bbox = self.projection_finder(ref, self.butler, logger=self.logger)
             # Transform the stencil to pixel coordinates.
-            pixel_stencil = stencil.to_pixels(wcs, bbox)
-        # Somewhere to store metadata.
-        metadata = PropertyList()
+            pixel_stencil = stencil.to_pixels(projection, bbox)
+
         # Actually read the cutout.  Leave it to the butler to cache remote
         # files locally or do partial remote reads.
         with time_this(
@@ -362,134 +609,59 @@ class ImageCutoutFactory:
         ):
             match cutout_mode:
                 case CutoutMode.FULL_EXPOSURE:
-                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
+                    assert pixel_stencil is not None
+                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox.to_legacy()})
                     timesys = cutout.metadata.get("TIMESYS", timesys)
                 case CutoutMode.STRIPPED_EXPOSURE:
-                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox})
-                    metadata = cutout.metadata  # Track metadata externally.
-                    timesys = metadata.get("TIMESYS", timesys)
+                    assert pixel_stencil is not None
+                    cutout = self.butler.get(ref, parameters={"bbox": pixel_stencil.bbox.to_legacy()})
+                    original_metadata = cutout.metadata
+                    timesys = original_metadata.get("TIMESYS", timesys)
                     cutout = makeExposure(cutout.maskedImage, wcs=cutout.wcs)
+
+                    # A full exposure so we can store the metadata back in it.
+                    cutout.setMetadata(original_metadata)
                 case CutoutMode.IMAGE_ONLY:
+                    assert pixel_stencil is not None
                     cutout = self.butler.get(
-                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     # No metadata so UTC is default.
                     timesys = "UTC"
                 case CutoutMode.MASKED_IMAGE:
                     # Rely on the file being cached on first read. Faster than
                     # reading entire exposure.
+                    assert pixel_stencil is not None
                     image = self.butler.get(
-                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("image"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     variance = self.butler.get(
-                        ref.makeComponentRef("variance"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("variance"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     mask = self.butler.get(
-                        ref.makeComponentRef("mask"), parameters={"bbox": pixel_stencil.bbox}
+                        ref.makeComponentRef("mask"), parameters={"bbox": pixel_stencil.bbox.to_legacy()}
                     )
                     wcs = self.butler.get(ref.makeComponentRef("wcs"))
                     masked_image = makeMaskedImage(image, mask, variance)
                     cutout = makeExposure(masked_image, wcs=wcs)
 
-                    metadata = self.butler.get(ref.makeComponentRef("metadata"))
-                    timesys = metadata.get("TIMESYS", timesys)
+                    original_metadata = self.butler.get(ref.makeComponentRef("metadata"))
+                    timesys = original_metadata.get("TIMESYS", timesys)
+
+                    # The cutout is an Exposure so we can attach metadata.
+                    cutout.setMetadata(original_metadata)
+
                 case CutoutMode.ASTROPY_IMAGE | CutoutMode.ASTROPY_MASKED_IMAGE:
-                    # Bypass butler and try to find the pixel HDU directly.
-                    # Approximate WCS is attached to DP1 image data but needs
-                    # to be shifted.
-                    pixel_components = {"image", "mask", "variance"}
-                    if cutout_mode == CutoutMode.ASTROPY_IMAGE:
-                        pixel_components = {"image"}
-                    uri = self.butler.getURI(ref)
-                    fs, fspath = uri.to_fsspec()
-                    hdul = []
-                    # Want the primary header and the requested pixel HDU.
-                    # Stop scanning once IMAGE has been located.
-                    found_primary = False
-                    with fs.open(fspath) as f, astropy.io.fits.open(f) as fits_obj:
-                        for hdu in fits_obj:
-                            if not found_primary:
-                                hdul.append(hdu.copy())
-                                timesys = hdul[0].header.get("TIMESYS", timesys)
-                                found_primary = True
-                                continue
-
-                            hdr = hdu.header
-                            extname = hdr.get("EXTNAME")
-                            if extname and extname.lower() in pixel_components:
-                                pixel_components.remove(extname.lower())
-                                # Get BBOX for full HDU.
-                                # Use shape to prevent reading the data array.
-                                shape = hdu.shape
-                                dimensions = lsst.geom.Extent2I(shape[1], shape[0])
-
-                                # XY0 is defined in the A WCS.
-                                pl = PropertyList()
-                                pl.update(hdr)
-                                xy0 = getImageXY0FromMetadata(pl, "A", strip=False)
-
-                                # This is the PARENT bbox.
-                                full_bbox = lsst.geom.Box2I(xy0, dimensions)
-
-                                # Calculate the cutout bbox from the stencil.
-                                if pixel_stencil is None:
-                                    # Use FITS WCS.
-                                    wcs = makeSkyWcs(pl)
-                                    pixel_stencil = stencil.to_pixels(wcs, full_bbox)
-                                    bbox = pixel_stencil.bbox
-
-                                # Work out the required cutout of the HDU.
-                                minX = bbox.getBeginX() - full_bbox.getBeginX()
-                                maxX = bbox.getEndX() - full_bbox.getBeginX()
-                                minY = bbox.getBeginY() - full_bbox.getBeginY()
-                                maxY = bbox.getEndY() - full_bbox.getBeginY()
-                                # Get the cutout and detach from remote.
-                                data = hdu.section[minY:maxY, minX:maxX].copy()
-
-                                # Must correct the header WCS to take into
-                                # account the offset.
-                                if (k := "CRPIX1") in hdr:
-                                    hdr[k] -= minX
-                                if (k := "CRPIX2") in hdr:
-                                    hdr[k] -= minY
-                                if (k := "LTV1") in hdr:
-                                    hdr[k] = -bbox.getBeginX()
-                                if (k := "LTV2") in hdr:
-                                    hdr[k] = -bbox.getBeginY()
-                                if (k := "CRVAL1A") in hdr:
-                                    hdr[k] = bbox.getBeginX()
-                                if (k := "CRVAL2A") in hdr:
-                                    hdr[k] = bbox.getBeginY()
-
-                                # Create new HDU with the cutout.
-                                cutout_hdu = astropy.io.fits.ImageHDU(data=data, header=hdr.copy())
-                                hdul.append(cutout_hdu)
-
-                            # Stop looking for HDUs.
-                            if not pixel_components:
-                                break
-                    cutout = astropy.io.fits.HDUList(hdus=hdul)
+                    # Bypass butler and read the pixel HDU directly.
+                    cutout, pixel_stencil, timesys = self._read_astropy_hdulist(cutout_mode, stencil, ref)
                 case _:
                     raise ValueError(f"Unsupported cutout mode: {cutout_mode}")
 
-        # Create some FITS metadata with the cutout parameters.
-        metadata.set("BTLRUUID", ref.id.hex, "Butler dataset UUID this cutout was extracted from.")
-        metadata.set(
-            "BTLRNAME", ref.datasetType.name, "Butler dataset type name this cutout was extracted from."
-        )
-        for n, (k, v) in enumerate(ref.dataId.required.items()):
-            # Write data ID dictionary sort of like a list of 2-tuples, to make
-            # it easier to stay within the FITS 8-char key limit.
-            metadata.set(f"BTLRK{n:03}", k, f"Name of dimension {n} in the data ID.")
-            metadata.set(f"BTLRV{n:03}", v, f"Value of dimension {n} in the data ID.")
-        stencil.to_fits_metadata(metadata)
+        # Create the provenance header with the cutout parameters.
+        metadata = self._record_cutout_provenance(ref, now, stencil, timesys)
 
-        # Record the time and software version.
-        now.format = "fits"
-        now = now.tai if timesys.lower() == "tai" else now.utc
-        metadata.set("DATE-CUT", str(now), "Time of cutout extraction")
-        metadata.set("CUTVERS", __version__, "dax_images_cutout software version")
-
+        # Every supported cutout mode produces a pixel stencil above.
+        assert pixel_stencil is not None
         return Extraction(
             cutout=cutout,
             sky_stencil=stencil,
@@ -497,6 +669,129 @@ class ImageCutoutFactory:
             metadata=metadata,
             origin_ref=ref,
         )
+
+    def _extract_ref_v2(
+        self, stencil: SkyStencil, ref: DatasetRef, cutout_mode: CutoutMode = CutoutMode.FULL_EXPOSURE
+    ) -> Extraction:
+        """Extract a subimage from a fully-resolved `DatasetRef` associated
+        with a lsst.images model.
+
+        Parameters
+        ----------
+        stencil : `SkyStencil`
+            Definition of the cutout region, in sky coordinates.
+        ref : `DatasetRef`
+            Fully-resolved reference to the dataset to obtain the cutout from.
+            Must have ``DatasetRef.id`` not `None` (use `extract_search`
+            instead when this is not the case).  Need not have an expanded data
+            ID.  May represent an image-like dataset component.
+
+        Returns
+        -------
+        result : `Extraction`
+            Struct that combines the cutout itself with additional metadata
+            and the pixel-coordinate stencil.  The cutout is not masked;
+            `Extraction.mask` must be called explicitly if desired.
+        """
+        if ref.id is None:
+            raise ValueError(f"A resolved DatasetRef is required; got {ref}.")
+        # Timestamp of the cutout extraction.
+        now = astropy.time.Time.now()
+        timesys = "UTC"
+        pixel_stencil = None
+
+        # There are two distinct modes of operation. One is using the native
+        # lsst.images interface, the other is using Astropy to deal with
+        # IMAGE and MASKED_IMAGE by using standard FITS conventions.
+        if cutout_mode not in (CutoutMode.ASTROPY_IMAGE, CutoutMode.ASTROPY_MASKED_IMAGE):
+            # To reduce round-trips to an object store we want to open the file
+            # once and then read out the components we need. In theory we can
+            # ask Butler get to return multiple components but if we do that
+            # we do not know the bounding box to use unless we add a skybox
+            # parameter to get that lets us pass in a stencil directly.
+            # This means we have to use the URI for direct access, bypassing
+            # butler get for now.
+            uri = self.butler.getURI(ref)
+
+            # Time the full open and retrieval.
+            with time_this(
+                self.logger,
+                msg="Extract cutout",
+                kwargs={"id": str(ref.id), "cutout_mode": str(cutout_mode), "stencil": str(stencil)},
+                level=_TIMER_LOG_LEVEL,
+            ):
+                with lsst.images.serialization.open(uri) as reader:
+                    sky_projection = reader.get_component("sky_projection")
+                    bbox = reader.get_component("bbox")
+
+                    # Transform the stencil to pixel coordinates.
+                    pixel_stencil = stencil.to_pixels(sky_projection, bbox)
+                    modern_bbox = pixel_stencil.bbox
+
+                    match cutout_mode:
+                        case CutoutMode.FULL_EXPOSURE:
+                            cutout = reader.read(bbox=modern_bbox)
+                        case CutoutMode.IMAGE_ONLY:
+                            cutout = reader.get_component("image", bbox=modern_bbox)
+                        case CutoutMode.MASKED_IMAGE | CutoutMode.STRIPPED_EXPOSURE:
+                            # A Stripped exposure is meaningless with the
+                            # new models since MaskedImage now carries a
+                            # WCS and metadata.
+                            cutout = reader.get_component("masked_image", bbox=modern_bbox)
+                        case _:
+                            raise ValueError(f"Unsupported cutout mode: {cutout_mode}")
+
+            if cutout._opaque_metadata is not None:
+                timesys = cutout._opaque_metadata.headers[ExtensionKey()].get("TIMESYS", timesys)
+
+        else:
+            # This is the Astropy direct branch.
+            with time_this(
+                self.logger,
+                msg="Extract cutout",
+                kwargs={"id": str(ref.id), "cutout_mode": str(cutout_mode), "stencil": str(stencil)},
+                level=_TIMER_LOG_LEVEL,
+            ):
+                # Bypass butler and lsst.images and go straight to the HDUs.
+                cutout, pixel_stencil, timesys = self._read_astropy_hdulist(cutout_mode, stencil, ref)
+
+        # Create some FITS metadata with the cutout parameters.
+        metadata = self._record_cutout_provenance(ref, now, stencil, timesys)
+
+        # Every supported cutout mode produces a pixel stencil above.
+        assert pixel_stencil is not None
+        return Extraction(
+            cutout=cutout,
+            sky_stencil=stencil,
+            pixel_stencil=pixel_stencil,
+            metadata=metadata,
+            origin_ref=ref,
+        )
+
+    def _record_cutout_provenance(
+        self, ref: DatasetRef, start_time: astropy.time.Time, stencil: SkyStencil, timesys: str
+    ) -> astropy.io.fits.Header:
+        header = astropy.io.fits.Header()
+
+        # Create some FITS metadata with the cutout parameters.
+        # Some of these are added as provenance by the butler on write so may
+        # no longer be necessary.
+        header.set("BTLRUUID", ref.id.hex, "Butler UUID of full image")
+        header.set("BTLRNAME", ref.datasetType.name, "Butler dataset type")
+        for n, (k, v) in enumerate(ref.dataId.required.items()):
+            # Write data ID dictionary sort of like a list of 2-tuples, to make
+            # it easier to stay within the FITS 8-char key limit.
+            header.set(f"BTLRK{n:03}", k, f"Name of dimension {n} in the data ID")
+            header.set(f"BTLRV{n:03}", v, f"Value of dimension {n} in the data ID")
+        header.extend(stencil.to_fits_metadata())
+
+        # Record the time and software version.
+        start_time.format = "fits"
+        start_time = start_time.tai if timesys.lower() == "tai" else start_time.utc
+        header.set("DATE-CUT", str(start_time), "Time of cutout extraction")
+        header.set("CUTVERS", __version__, "dax_images_cutout software version")
+
+        return header
 
     def extract_uuid(
         self,

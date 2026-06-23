@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 __all__ = (
-    "PixelPolygon",
+    "MaskBackend",
     "PixelStencil",
     "SkyCircle",
     "SkyPolygon",
@@ -30,22 +30,65 @@ __all__ = (
     "StencilNotContainedError",
 )
 
+import enum
 import struct
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from hashlib import blake2b
 
 import astropy.coordinates
+import astropy.io.fits
+import astropy.units as u
 import numpy as np
+import starlink.Ast as Ast
+from astropy.coordinates import SkyCoord
 
-import lsst.afw.detection
-import lsst.afw.geom.ellipses
-import lsst.afw.geom.polygon
 import lsst.sphgeom
-from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
-from lsst.afw.image import Mask
-from lsst.daf.base import PropertyList
-from lsst.geom import Angle, Box2D, Box2I, Point2D, SpherePoint, radians
+from lsst.images import Box, Mask, NoOverlapError, SkyProjection
+from lsst.sphgeom import Angle, LonLat, UnitVector3d
+
+
+class MaskBackend(enum.Enum):
+    """Selects the algorithm used to rasterize a stencil onto pixels."""
+
+    AST = enum.auto()
+    """Mask using starlink-pyast ``Region.mask`` on the true sky region."""
+
+    SPHGEOM = enum.auto()
+    """Mask by testing pixel centers against the ``lsst.sphgeom`` region."""
+
+
+def _skycoord_from_lonlat(lonlat: LonLat) -> SkyCoord:
+    """Return an ICRS `astropy.coordinates.SkyCoord` for a `sphgeom.LonLat`."""
+    return SkyCoord(
+        ra=lonlat.getLon().asRadians() * u.rad,
+        dec=lonlat.getLat().asRadians() * u.rad,
+        frame="icrs",
+    )
+
+
+class _AstLineSource:
+    """Feeds AST-native text lines to a `starlink.Ast.Channel`."""
+
+    def __init__(self, text: str) -> None:
+        self._lines = text.splitlines()
+
+    def astsource(self) -> str | None:
+        return self._lines.pop(0) if self._lines else None
+
+
+def _starlink_sky_to_pixel(projection: SkyProjection) -> Ast.Mapping:
+    """Return the sky->pixel mapping of ``projection`` as a starlink-pyast
+    Mapping.
+
+    ``lsst.images`` may wrap AST with either astshim or starlink-pyast
+    depending on the runtime environment.  The transform is serialized to
+    AST's native text form via the public `~lsst.images.Transform.show`
+    method and re-read with starlink-pyast, so that all region masking
+    happens in starlink-pyast regardless of which wrapper ``lsst.images``
+    uses internally.
+    """
+    return Ast.Channel(_AstLineSource(projection.sky_to_pixel_transform.show())).read()
 
 
 class StencilNotContainedError(RuntimeError):
@@ -59,101 +102,199 @@ class PixelStencil(ABC):
 
     @property
     @abstractmethod
-    def bbox(self) -> Box2I:
-        """Bounding box of this stencil in pixel coordinates."""
+    def bbox(self) -> Box:
+        """Bounding box of this stencil, as a `lsst.images.Box`."""
         raise NotImplementedError()
 
     @abstractmethod
-    def set_mask(self, mask: Mask, bits: int) -> None:
-        """Set mask planes for the pixels covered by this stencil.
+    def _coverage(self) -> np.ndarray:
+        """Boolean array over `bbox`, `True` for pixels the stencil covers.
 
-        Parameters
-        ----------
-        mask : `Mask`
-            Mask to modify in-place.
-        bits : `int`
-            Integer bitmask to bitwise-OR into pixels covered by the stencil.
-
-        Notes
-        -----
-        The what "pixels covered by" means in detail is implementation-defined,
-        at least at present.
+        The array has shape ``bbox.shape`` (``(ny, nx)``).
         """
         raise NotImplementedError()
 
+    def set_mask(self, mask: Mask, plane: str, *, covered: bool = True) -> None:
+        """Set a mask plane for pixels inside or outside the stencil.
 
-class PixelPolygon(PixelStencil):
-    """A pixel-coordinate stencil backed by a polygon.
+        Parameters
+        ----------
+        mask : `lsst.images.Mask`
+            Mask to modify in-place.  Its schema must already define ``plane``
+            and its bounding box must contain `bbox`.
+        plane : `str`
+            Name of the mask plane to set.
+        covered : `bool`, optional
+            If `True` (default), set ``plane`` where the stencil covers a pixel
+            center.  If `False`, set ``plane`` where the stencil does *not*
+            cover a pixel, including the region of ``mask`` that lies outside
+            `bbox`.
+        """
+        coverage = self._coverage()
+        if not covered:
+            coverage = np.logical_not(coverage)
+        # Pixels outside the stencil's bounding box are never covered, so they
+        # take the value assigned to uncovered pixels.
+        full = np.full(mask.bbox.shape, not covered, dtype=bool)
+        y_off = self.bbox.y.min - mask.bbox.y.min
+        x_off = self.bbox.x.min - mask.bbox.x.min
+        full[y_off : y_off + self.bbox.shape.y, x_off : x_off + self.bbox.shape.x] = coverage
+        mask.set(plane, full)
+
+
+class _AstPixelRegion(PixelStencil):
+    """Pixel-coordinate stencil backed by a starlink-pyast sky `Region`.
 
     Parameters
     ----------
-    polygon : `lsst.afw.geom.polygon.Polygon`
-        Backing polygon.
-    bbox : `Box2I`, optional
-        If provided (`None` is default), a pixel bounding box to clip
-        the polygon to.
-
-    Notes
-    -----
-    This class is backed by a polygon with straight-line edges in the image
-    pixel coordinate system; this corresponds exactly to a great-circle polygon
-    on the sky only for gnomonic projections.
-
-    The `set_mask` implementation for this class currently masks pixels that
-    are more than 50% covered by the polygon, which may not be the same as
-    pixels whose centers are contained by the polygon when a vertex lies within
-    a pixel.  This may change in the future.
+    sky_region : `starlink.Ast.Region`
+        The stencil region expressed in an ICRS sky frame.
+    sky_to_pixel : `starlink.Ast.Mapping`
+        Mapping whose forward direction transforms sky coordinates to pixels,
+        as required by ``Region.mask`` (region frame to grid).
+    bbox : `lsst.images.Box`
+        Bounding box the stencil is restricted to.
     """
 
-    def __init__(self, polygon: lsst.afw.geom.polygon.Polygon, bbox: Box2I | None = None):
-        self._polygon = polygon
-        self._bbox = Box2I(polygon.getBBox())
-        if bbox is not None:
-            self._bbox.clip(bbox)
-            self._polygon = self._polygon.intersectionSingle(Box2D(self._bbox))
+    def __init__(self, sky_region: Ast.Region, sky_to_pixel: Ast.Mapping, bbox: Box) -> None:
+        self._sky_region = sky_region
+        self._sky_to_pixel = sky_to_pixel
+        self._bbox = bbox
 
     @property
-    def bbox(self) -> Box2I:
+    def bbox(self) -> Box:
         # Docstring inherited.
         return self._bbox
 
-    def set_mask(self, mask: Mask, bits: int) -> None:
+    def _coverage(self) -> np.ndarray:
         # Docstring inherited.
-        image = self._polygon.createImage(self.bbox)
-        submask = mask[self.bbox]
-        submask.array[:, :] |= bits * (image.array > 0.5)
+        scratch = np.zeros(self._bbox.shape, dtype=np.int64)
+        self._sky_region.mask(
+            self._sky_to_pixel,
+            1,
+            [self._bbox.x.min, self._bbox.y.min],
+            [self._bbox.x.max, self._bbox.y.max],
+            scratch,
+            1,
+        )
+        return scratch != 0
+
+
+class _SphgeomPixelRegion(PixelStencil):
+    """Pixel-coordinate stencil that tests pixel centers against a sphgeom
+    region.
+
+    Parameters
+    ----------
+    region : `lsst.sphgeom.Region`
+        Sky region to test pixel centers against.
+    projection : `lsst.images.SkyProjection`
+        Mapping used to convert pixel centers to sky coordinates.
+    bbox : `lsst.images.Box`
+        Bounding box the stencil is restricted to.
+    """
+
+    def __init__(self, region: lsst.sphgeom.Region, projection: SkyProjection, bbox: Box) -> None:
+        self._region = region
+        self._projection = projection
+        self._bbox = bbox
+
+    @property
+    def bbox(self) -> Box:
+        # Docstring inherited.
+        return self._bbox
+
+    def _coverage(self) -> np.ndarray:
+        # Docstring inherited.
+        grid = self._bbox.meshgrid()
+        sky = self._projection.pixel_to_sky(x=grid.x.ravel(), y=grid.y.ravel())
+        return self._region.contains(sky.ra.radian, sky.dec.radian).reshape(self._bbox.shape)
 
 
 class SkyStencil(ABC):
     """An image cutout stencil defined in sky (ICRS) coordinates."""
 
-    @abstractmethod
-    def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
-        """Transform to a pixel-coordinate set of spans.
+    _clip: bool
+
+    def to_pixels(
+        self,
+        projection: SkyProjection,
+        bbox: Box,
+        *,
+        backend: MaskBackend = MaskBackend.AST,
+    ) -> PixelStencil:
+        """Transform to a pixel-coordinate stencil.
 
         Parameters
         ----------
-        wcs : `SkyWcs`
+        projection : `lsst.images.SkyProjection`
             Mapping from sky coordinates to pixel coordinates.
-        bbox : `Box2I`
+        bbox : `lsst.images.Box`
             Bounds that the returned stencil must lie within.
+        backend : `MaskBackend`, optional
+            Algorithm used to rasterize the stencil.  Defaults to
+            `MaskBackend.AST`.
 
         Returns
         -------
         pixels : `PixelStencil`
             Pixel-coordinate stencil object.  `PixelStencil.bbox` is guaranteed
-            to be contained by the given ``bbox`` for this object.
+            to be contained by the given ``bbox``.
 
         Raises
         ------
         StencilNotContainedError
-            May be raised if the pixel-coordinate stencil does not lie within
-            ``bbox``.  Implementations may also clip instead.
+            Raised when ``clip`` is `False` and the pixel-coordinate stencil
+            does not lie within ``bbox``.
+        """
+        tight = self._pixel_bbox(projection)
+        final = self._resolve_box(tight, bbox)
+        if backend is MaskBackend.AST:
+            return _AstPixelRegion(self._ast_sky_region(), _starlink_sky_to_pixel(projection), final)
+        if backend is MaskBackend.SPHGEOM:
+            return _SphgeomPixelRegion(self.region, projection, final)
+        raise ValueError(f"Unknown mask backend: {backend!r}.")
 
-        Notes
-        -----
-        This operation may be an approximation; see concrete class
-        documentation for additional information.
+    def _pixel_bbox(self, projection: SkyProjection) -> Box:
+        """Compute the tight pixel bounding box of this stencil.
+
+        The boundary is sampled on the sky and transformed to pixels, so both
+        mask backends share an identical bounding box.
+        """
+        xy = projection.sky_to_pixel(self._boundary_skycoord())
+        return Box.from_float_bounds(
+            x_min=float(np.min(xy.x)),
+            x_max=float(np.max(xy.x)),
+            y_min=float(np.min(xy.y)),
+            y_max=float(np.max(xy.y)),
+        )
+
+    def _resolve_box(self, tight: Box, box: Box) -> Box:
+        """Clip ``tight`` to ``box`` or raise if not contained.
+
+        Honors the stencil's ``clip`` flag: when clipping, returns the
+        intersection (raising `StencilNotContainedError` when disjoint); when
+        not clipping, returns ``tight`` only if ``box`` contains it.
+        """
+        if self._clip:
+            try:
+                return tight.intersection(box)
+            except NoOverlapError:
+                raise StencilNotContainedError(f"{self} does not overlap {box}.") from None
+        if not box.contains(tight):
+            raise StencilNotContainedError(f"{self} has pixel bbox {tight}, which is not within {box}.")
+        return tight
+
+    @abstractmethod
+    def _ast_sky_region(self) -> Ast.Region:
+        """Return a starlink-pyast `Region` in an ICRS sky frame."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def _boundary_skycoord(self) -> SkyCoord:
+        """Return sky coordinates sampling the stencil boundary.
+
+        Used to size the pixel bounding box.
         """
         raise NotImplementedError()
 
@@ -164,23 +305,18 @@ class SkyStencil(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def to_fits_metadata(self, metadata: PropertyList) -> None:
-        """Write FITS header entries that describe the stencil.
+    def to_fits_metadata(self) -> astropy.io.fits.Header:
+        """Return FITS header cards that describe the stencil.
 
-        Parameters
-        ----------
-        metadata : `PropertyList`
-            Metadata, to be modified in place.
+        The cards carry per-keyword comments and are merged into the cutout
+        provenance header.
         """
         raise NotImplementedError()
 
     @property
     @abstractmethod
     def fingerprint(self) -> bytes:
-        """A 16-byte blob that is unique to this stencil.
-
-        This may be a hash or a reversible encoding.
-        """
+        """A 16-byte blob that is unique to this stencil."""
         raise NotImplementedError()
 
 
@@ -189,30 +325,30 @@ class SkyCircle(SkyStencil):
 
     Parameters
     ----------
-    center : `SpherePoint`
-        The center of the circle, in ICRS (ra, dec).
-    radius : `Angle`
+    center : `lsst.sphgeom.LonLat`
+        The center of the circle, in ICRS (longitude, latitude).
+    radius : `lsst.sphgeom.Angle`
         Radius of the circle.
     clip : `bool`, optional
         If `True` (`False` is default), clip pixel stencils returned by
         `to_pixels` instead of raising `StencilNotContainedError`.
-
-    Notes
-    -----
-    The `to_pixels` implementation for this class converts the sky region to a
-    polygon with approximately arcsecond vertices (but a minimum of 12
-    vertices), and then converts that to pixel coordinates.
     """
 
-    MAX_POLYGON_VERTICES = 64
+    #: Number of points used to sample the circle boundary when sizing the
+    #: pixel bounding box.
+    BOUNDARY_SAMPLES = 64
 
-    def __init__(self, center: SpherePoint, radius: Angle, clip: bool = False):
+    def __init__(self, center: LonLat, radius: Angle, clip: bool = False):
         self._center = center
         self._radius = radius
         self._clip = clip
 
     def __repr__(self) -> str:
-        return f"SkyCircle({self._center!r}, {self._radius!r}, clip={self._clip!r})"
+        return (
+            f"SkyCircle(LonLat.fromRadians({self._center.getLon().asRadians()!r}, "
+            f"{self._center.getLat().asRadians()!r}), "
+            f"Angle({self._radius.asRadians()!r}), clip={self._clip!r})"
+        )
 
     @classmethod
     def from_astropy(
@@ -223,9 +359,9 @@ class SkyCircle(SkyStencil):
         Parameters
         ----------
         center : `astropy.coordinates.SkyCoord`
-            The center of the circle, in ICRS (ra, dec).
-        radius : `Angle`
-            Radius of the circle.
+            The center of the circle, in ICRS (ra, dec).  Must be scalar.
+        radius : `astropy.coordinates.Angle`
+            Radius of the circle.  Must be scalar.
         clip : `bool`, optional
             If `True` (`False` is default), clip pixel stencils returned by
             `to_pixels` instead of raising `StencilNotContainedError`.
@@ -234,14 +370,9 @@ class SkyCircle(SkyStencil):
         -------
         stencil : `SkyCircle`
             Circular stencil.
-
-        Raises
-        ------
-        ValueError
-            Raised if ``center`` or ``radius`` is not scalar-valued.
         """
         return cls(
-            center=_spherepoint_from_astropy(center),
+            center=_lonlat_from_astropy(center),
             radius=_angle_from_astropy(radius),
             clip=clip,
         )
@@ -249,7 +380,7 @@ class SkyCircle(SkyStencil):
     @classmethod
     def from_sphgeom(cls, circle: lsst.sphgeom.Circle, clip: bool = False) -> SkyCircle:
         """Construct from a `lsst.sphgeom.Circle` instance."""
-        return cls(SpherePoint(circle.getCenter()), Angle(circle.getOpeningAngle()), clip=clip)
+        return cls(LonLat(circle.getCenter()), circle.getOpeningAngle(), clip=clip)
 
     def to_polygon(self, n_vertices: int = 16) -> SkyPolygon:
         """Return a polygon sky stencil that approximates this circle.
@@ -266,40 +397,53 @@ class SkyCircle(SkyStencil):
 
         Notes
         -----
-        For large circles and/or highly nonlinear projections, this polygon
-        approximation can be mapped much more accurately to pixel coordinates.
+        This helper is retained for callers that want a polygon approximation;
+        it is no longer used by `to_pixels`, which masks the true circle.
         """
-        factor = (2 * np.pi / n_vertices) * radians
-        return SkyPolygon(
-            (self._center.offset(b * factor, self._radius) for b in range(n_vertices)), clip=self._clip
+        center = _skycoord_from_lonlat(self._center)
+        position_angle = (np.arange(n_vertices) / n_vertices * 2.0 * np.pi) * u.rad
+        radius = astropy.coordinates.Angle(self._radius.asRadians() * u.rad)
+        points = center.directional_offset_by(position_angle, radius)
+        vertices = [LonLat.fromRadians(float(p.ra.rad), float(p.dec.rad)) for p in points]
+        return SkyPolygon(vertices, clip=self._clip)
+
+    def _ast_sky_region(self) -> Ast.Region:
+        # Docstring inherited.
+        return Ast.Circle(
+            Ast.SkyFrame("System=ICRS"),
+            1,
+            [self._center.getLon().asRadians(), self._center.getLat().asRadians()],
+            [self._radius.asRadians()],
         )
 
-    def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
+    def _boundary_skycoord(self) -> SkyCoord:
         # Docstring inherited.
-        # convert to a polygon with ~arcsecond vertices
-        circumference = 2 * np.pi * np.sin(self._radius.asRadians()) * radians
-        n_vertices = min(max(16, int(np.round(circumference.asArcseconds()))), self.MAX_POLYGON_VERTICES)
-        return self.to_polygon(n_vertices).to_pixels(wcs, bbox)
+        center = _skycoord_from_lonlat(self._center)
+        position_angle = (np.arange(self.BOUNDARY_SAMPLES) / self.BOUNDARY_SAMPLES * 2.0 * np.pi) * u.rad
+        radius = astropy.coordinates.Angle(self._radius.asRadians() * u.rad)
+        return center.directional_offset_by(position_angle, radius)
 
     @property
     def region(self) -> lsst.sphgeom.Region:
         # Docstring inherited.
-        return lsst.sphgeom.Circle(self._center.getVector(), self._radius)
+        return lsst.sphgeom.Circle(UnitVector3d(self._center), self._radius)
 
-    def to_fits_metadata(self, metadata: PropertyList) -> None:
+    def to_fits_metadata(self) -> astropy.io.fits.Header:
         # Docstring inherited.
-        metadata.set("ST_TYPE", "CIRCLE", "Type of stencil used to create this cutout.")
-        metadata.set("ST_RA", self._center.getRa().asDegrees(), "Circle center right ascension in degrees.")
-        metadata.set("ST_DEC", self._center.getDec().asDegrees(), "Circle center declination in degrees.")
-        metadata.set("ST_RAD", self._radius.asDegrees(), "Circle radius in degrees.")
+        header = astropy.io.fits.Header()
+        header.set("ST_TYPE", "CIRCLE", "Type of stencil used to create this cutout")
+        header.set("ST_RA", self._center.getLon().asDegrees(), "[deg] Circle center Right Ascension")
+        header.set("ST_DEC", self._center.getLat().asDegrees(), "[deg] Circle center Declination")
+        header.set("ST_RAD", self._radius.asDegrees(), "[deg] Circle radius")
+        return header
 
     @property
     def fingerprint(self) -> bytes:
         # Docstring inherited.
         hasher = blake2b(digest_size=16)
         hasher.update(b"CIRCLE")
-        hasher.update(struct.pack("!d", self._center.getRa().asRadians()))
-        hasher.update(struct.pack("!d", self._center.getDec().asRadians()))
+        hasher.update(struct.pack("!d", self._center.getLon().asRadians()))
+        hasher.update(struct.pack("!d", self._center.getLat().asRadians()))
         hasher.update(struct.pack("!d", self._radius.asRadians()))
         return hasher.digest()
 
@@ -309,7 +453,7 @@ class SkyPolygon(SkyStencil):
 
     Parameters
     ----------
-    vertices : `Iterable` [ `SpherePoint` ]
+    vertices : `Iterable` [ `lsst.sphgeom.LonLat` ]
         Vertices of the polygon, CCW when looking out from the origin.
         Implicitly closed (the first vertex should not be duplicated as the
         last).
@@ -323,18 +467,18 @@ class SkyPolygon(SkyStencil):
     orientation may result in unspecified failures in `to_pixels`.
     """
 
-    def __init__(self, vertices: Iterable[SpherePoint], clip: bool = False):
+    def __init__(self, vertices: Iterable[LonLat], clip: bool = False):
         self._vertices = tuple(vertices)
         self._clip = clip
 
     @classmethod
     def from_astropy(cls, vertices: astropy.coordinates.SkyCoord, clip: bool = False) -> SkyPolygon:
-        """Construct from `astropy.coordinates` arguments.
+        """Construct from an array-valued `astropy.coordinates.SkyCoord`.
 
         Parameters
         ----------
         vertices : `astropy.coordinates.SkyCoord`
-            Array of vertices.  CCW when looking out from the origin.
+            Array of vertices, CCW when looking out from the origin.
             Implicitly closed (the first vertex should not be duplicated as the
             last).
         clip : `bool`, optional
@@ -346,46 +490,56 @@ class SkyPolygon(SkyStencil):
         stencil : `SkyPolygon`
             Polygon stencil.
         """
-        return cls((_spherepoint_from_astropy(v) for v in vertices), clip=clip)
+        return cls((_lonlat_from_astropy(v) for v in vertices), clip=clip)
 
-    def to_pixels(self, wcs: SkyWcs, bbox: Box2I) -> PixelStencil:
+    def _ast_sky_region(self) -> Ast.Region:
         # Docstring inherited.
-        pixel_vertices = wcs.skyToPixel(self._vertices)
-        pixel_vertices.append(pixel_vertices[0])  # afw.polygon expects to be explicitly closed
-        # Input sky coordinates should be CCW looking out, and afw.polygon
-        # expects pixel coordinates to be CW.  First question is whether the
-        # WCS has a parity flip, which is frustratingly not something we can
-        # ask it (or the underlying AST object) directly, so we compute the
-        # determinant of a linear approximation.  It doesn't matter where,
-        # since the polarity can't actually change with position
-        affine = wcs.linearizeSkyToPixel(self._vertices[0], radians)
-        if affine.getLinear().computeDeterminant() > 1:
-            # No parity flip, so we have to reverse the vertices ourselves.
-            pixel_vertices = reversed(pixel_vertices)
-        result = PixelPolygon(
-            lsst.afw.geom.polygon.Polygon(pixel_vertices), bbox=(bbox if self._clip else None)
+        sky_frame = Ast.SkyFrame("System=ICRS")
+        ra = [v.getLon().asRadians() for v in self._vertices]
+        dec = [v.getLat().asRadians() for v in self._vertices]
+        centroid = lsst.sphgeom.LonLat(self.region.getCentroid())
+        probe = [centroid.getLon().asRadians(), centroid.getLat().asRadians()]
+        polygon = Ast.Polygon(sky_frame, np.array([ra, dec]))
+        # AST's bounded interior depends on vertex winding: with the wrong
+        # winding the polygon represents its own complement.  ``negate`` flips
+        # ``pointinregion`` but not the ``mask`` polarity, so reverse the
+        # vertices instead to obtain a region whose interior is the polygon.
+        if not polygon.pointinregion(probe):
+            polygon = Ast.Polygon(sky_frame, np.array([ra[::-1], dec[::-1]]))
+        # ``Region.mask`` rasterizes by simplifying the region into the pixel
+        # frame.  By default AST re-fits the polygon to straight-edged
+        # pixel-space vertices, discarding the great-circle curvature of the
+        # edges whenever the sky-to-pixel projection is non-gnomonic.
+        # ``SimpVertices=0`` makes AST keep the curved edges unless they match
+        # the straight approximation to within the region's uncertainty.
+        polygon.set("SimpVertices=0")
+        return polygon
+
+    def _boundary_skycoord(self) -> SkyCoord:
+        # Docstring inherited.
+        return SkyCoord(
+            ra=[v.getLon().asRadians() for v in self._vertices] * u.rad,
+            dec=[v.getLat().asRadians() for v in self._vertices] * u.rad,
+            frame="icrs",
         )
-        if not self._clip and not bbox.contains(result.bbox):
-            raise StencilNotContainedError(
-                f"{self} has bbox {result.bbox} in pixel coordinates, which is not within {bbox}."
-            )
-        return result
 
     @property
     def region(self) -> lsst.sphgeom.Region:
         # Docstring inherited.
-        return lsst.sphgeom.ConvexPolygon([v.getVector() for v in self._vertices])
+        return lsst.sphgeom.ConvexPolygon([UnitVector3d(v) for v in self._vertices])
 
-    def to_fits_metadata(self, metadata: PropertyList) -> None:
+    def to_fits_metadata(self) -> astropy.io.fits.Header:
         # Docstring inherited.
-        metadata.set("ST_TYPE", "POLYGON", "Type of stencil used to create this cutout.")
+        header = astropy.io.fits.Header()
+        header.set("ST_TYPE", "POLYGON", "Type of stencil used to create this cutout")
         if len(self._vertices) > 100:
             raise NotImplementedError(
                 "TODO: FITS limitations make it difficult to serialize big stencils to the header."
             )
         for n, v in enumerate(self._vertices):
-            metadata.set(f"ST_RA{n:02d}", v.getRa().asDegrees(), f"Vertex {n} right ascension in degrees.")
-            metadata.set(f"ST_DEC{n:02d}", v.getDec().asDegrees(), f"Vertex {n} declination in degrees.")
+            header.set(f"ST_RA{n:02d}", v.getLon().asDegrees(), f"[deg] Vertex {n} Right Ascension")
+            header.set(f"ST_DEC{n:02d}", v.getLat().asDegrees(), f"[deg] Vertex {n} Declination")
+        return header
 
     @property
     def fingerprint(self) -> bytes:
@@ -393,12 +547,12 @@ class SkyPolygon(SkyStencil):
         hasher = blake2b(digest_size=16)
         hasher.update(b"POLYGON")
         for v in self._vertices:
-            hasher.update(struct.pack("!d!d", v.getRa().asRadians(), v.getDecx().asRadians()))
+            hasher.update(struct.pack("!dd", v.getLon().asRadians(), v.getLat().asRadians()))
         return hasher.digest()
 
 
 def _angle_from_astropy(angle: astropy.coordinates.Angle) -> Angle:
-    """Convert an `astropy.coordinates.Angle` to a `lsst.geom.Angle`.
+    """Convert an `astropy.coordinates.Angle` to a `lsst.sphgeom.Angle`.
 
     Parameters
     ----------
@@ -407,16 +561,16 @@ def _angle_from_astropy(angle: astropy.coordinates.Angle) -> Angle:
 
     Returns
     -------
-    angle : `lsst.geom.Angle`
-        LSST angle.
+    angle : `lsst.sphgeom.Angle`
+        Equivalent sphgeom angle.
     """
     if not angle.isscalar:
         raise ValueError("Only scalar angles are supported.")
-    return Angle(angle.rad * radians)
+    return Angle(angle.to_value(u.rad))
 
 
-def _spherepoint_from_astropy(skycoord: astropy.coordinates.SkyCoord) -> SpherePoint:
-    """Convert an `astropy.coordinates.SkyCoord` to a `lsst.geom.SpherePoint`.
+def _lonlat_from_astropy(skycoord: astropy.coordinates.SkyCoord) -> LonLat:
+    """Convert an `astropy.coordinates.SkyCoord` to a `lsst.sphgeom.LonLat`.
 
     Parameters
     ----------
@@ -425,28 +579,10 @@ def _spherepoint_from_astropy(skycoord: astropy.coordinates.SkyCoord) -> SphereP
 
     Returns
     -------
-    angle : `lsst.geom.SpherePoint`
-        LSST spherical point.
+    lonlat : `lsst.sphgeom.LonLat`
+        Equivalent spherical point.
     """
     if not skycoord.isscalar:
         raise ValueError("Only scalar coordinates are supported.")
     icrs = skycoord.transform_to("icrs")
-    return SpherePoint(icrs.ra.rad * radians, icrs.dec.rad * radians)
-
-
-def _make_local_gnomonic_wcs(position: SpherePoint) -> SkyWcs:
-    """Construct a WCS that represents a local gnomonic transform at a point.
-
-    Parameters
-    ----------
-    position : `SpherePoint`
-        Sky coordinate of the center of the projection.
-
-    Returns
-    -------
-    wcs : `SkyWcs`
-        A gnomonic (TAN) WCS with ``CRVAL=position``, ``CRPIX=(0,0)``, a pixel
-        scale of ``1/rad``, aligned such that ``(x, y)`` correspond to
-        ``(ra, dec)``.
-    """
-    return makeSkyWcs(Point2D(0.0, 0.0), position, makeCdMatrix(1.0 * radians))
+    return LonLat.fromRadians(float(icrs.ra.rad), float(icrs.dec.rad))

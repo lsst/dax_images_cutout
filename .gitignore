@@ -1,3 +1,4 @@
+.DS_Store
 _build.*
 .sconsign.dblite
 config.log
@@ -23,3 +24,4 @@ pytest_session.txt
 .coverage
 
 python/*.dist-info/
+python/*.egg-info/

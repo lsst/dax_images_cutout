@@ -24,31 +24,80 @@ from __future__ import annotations
 import unittest
 
 import astropy.coordinates
-import astropy.units
+import astropy.io.fits
+import astropy.units as u
+import astropy.wcs
 import numpy as np
 
 import lsst.sphgeom
-from lsst.afw.geom import SkyWcs, makeCdMatrix, makeSkyWcs
-from lsst.afw.image import Mask
-from lsst.dax.images.cutout.stencils import SkyCircle, SkyStencil
-from lsst.geom import Angle, Box2I, Point2D, Point2I, SpherePoint, arcseconds, degrees
+from lsst.dax.images.cutout.stencils import (
+    MaskBackend,
+    SkyCircle,
+    SkyPolygon,
+    SkyStencil,
+    StencilNotContainedError,
+)
+from lsst.images import Box, GeneralFrame, Mask, MaskPlane, MaskSchema, SkyProjection
+from lsst.sphgeom import Angle, LonLat, UnitVector3d  # noqa: F401  (used by eval(repr))
+
+# Bounding box for the cutout tests, in [y, x] (stop exclusive).  Slightly
+# bigger in x to catch x<->y transposition bugs.
+TEST_BOX = Box.factory[-13:28, -16:27]
+
+
+def _arcsec(value: float) -> Angle:
+    """Return a `lsst.sphgeom.Angle` for ``value`` arcseconds."""
+    return Angle((value * u.arcsec).to_value(u.rad))
+
+
+def _make_wcs() -> astropy.wcs.WCS:
+    """Build a gnomonic FITS WCS with 0.1 arcsec pixels at (12, 13) deg.
+
+    The reference pixel is placed at pixel (5, 7) so the stencils land at an
+    arbitrary nonzero offset within `TEST_BOX`.
+    """
+    wcs = astropy.wcs.WCS(naxis=2)
+    # FITS CRPIX is 1-based, so 0-based pixel (5, 7) is CRPIX (6, 8).
+    wcs.wcs.crpix = [6.0, 8.0]
+    wcs.wcs.crval = [12.0, 13.0]
+    scale = 0.1 / 3600.0
+    wcs.wcs.cd = [[-scale, 0.0], [0.0, scale]]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    return wcs
+
+
+def _make_car_wcs() -> astropy.wcs.WCS:
+    """Build a plate-carree (CAR) WCS referenced on the equator.
+
+    CAR is non-gnomonic, so great circles do not map to straight lines in
+    pixel space.  The equatorial reference keeps pixel coordinates a simple
+    (lon, lat) grid; a polygon placed at high declination then has edges that
+    bow well away from the straight chords joining its projected vertices.
+    """
+    wcs = astropy.wcs.WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    scale = 0.02
+    wcs.wcs.cd = [[-scale, 0.0], [0.0, scale]]
+    wcs.wcs.ctype = ["RA---CAR", "DEC--CAR"]
+    return wcs
+
+
+class ModuleHelpersTestCase(unittest.TestCase):
+    """Tests for module-level helpers that survive the rewrite."""
+
+    def test_mask_backend_members(self) -> None:
+        self.assertEqual({b.name for b in MaskBackend}, {"AST", "SPHGEOM"})
 
 
 class SkyCircleTestCase(unittest.TestCase):
-    """Tests for `SkyCircle."""
+    """Tests for `SkyCircle`."""
 
     def setUp(self) -> None:
-        self.center = SpherePoint(12.0, 13.0, degrees)
-        self.instance = SkyCircle(self.center, Angle(1.0, arcseconds))
+        self.center = LonLat.fromDegrees(12.0, 13.0)
+        self.instance = SkyCircle(self.center, _arcsec(1.0))
 
     def test_from_astropy(self) -> None:
-        """Test that the from_astropy factory function is equivalent to
-        passing the same values to the constructor, by comparing `region`
-        result.
-
-        This is a pretty circular test, but it's at least runs a lot of code
-        to make sure it's not completely broken.
-        """
         other = SkyCircle.from_astropy(
             astropy.coordinates.SkyCoord(
                 frame="icrs", ra=12.0 * astropy.units.deg, dec=13.0 * astropy.units.deg
@@ -58,146 +107,372 @@ class SkyCircleTestCase(unittest.TestCase):
         self.assertEqual(self.instance.region, other.region)
 
     def test_repr(self) -> None:
-        """Test that eval(repr(...)) round-trips."""
         self.assertEqual(eval(repr(self.instance)).region, self.instance.region)
 
     def test_to_pixel(self) -> None:
-        """Test `SkyCircle.to_pixel`, implicitly testing the
-        `PixelStencil` implementation it returns.
-        """
-        # WCS is gnomonic, with projection point at the circle center and
-        # 0.1" pixels, so 1" radius circle will have be about 20 pixels across
-        # the diameter.  Make the offset arbitray but nonzero.
-        wcs = makeSkyWcs(Point2D(5.0, 7.0), self.center, makeCdMatrix(0.1 * arcseconds))
-        # Bounding box should be roughly twice the size of the circle.
-        # Make it slightly bigger in x to catch x<->y transposition bugs.
-        bbox = Box2I(Point2I(-16, -13), Point2I(26, 27))
-        # Check to_pixel(...).set_mask(...) against a brute-force
-        # implementation.  The max_missing threshold (and implicitly, the
-        # max_extra=0 threshold) was set after inspection with plot=True to
-        # prevent accidental regressions.
-        _check_to_pixel(self, self.instance, wcs, bbox, max_missing=12)
+        _check_to_pixel(self, self.instance, _make_wcs(), backend=MaskBackend.AST, max_missing=2, max_extra=2)
 
     def test_to_polygon(self) -> None:
-        """Test conversion to a `SkyPolygon`.
-
-        This provides a lot of test coverage for `SkyPolygon` as well,
-        but it doesn't check the non-convex case (hard, since sphgeom doesn't
-        have a non-convex polygon), and it doesn't check conversion from
-        astropy or the documented orientation conventions.
-        """
-        # Same WCS and bbox as used in test_to_pixel.
-        wcs = makeSkyWcs(Point2D(5.0, 7.0), self.center, makeCdMatrix(0.1 * arcseconds))
-        bbox = Box2I(Point2I(-16, -13), Point2I(26, 27))
-        # Convert to polygon.
         polygon_stencil = self.instance.to_polygon()
-        # Make sure sphgeom regions at least aren't disjoint; in exact math
-        # the true circle would contain the polygon, but round-off error makes
-        # that not guaranteed with floats.
         self.assertNotEqual(
             self.instance.region.relate(polygon_stencil.region.getBoundingCircle()), lsst.sphgeom.DISJOINT
         )
-        # Check the polygon's to_pixel implementation.  The max_missing
-        # threshold (and implicitly, the max_extra=0 threshold) was set after
-        # inspection with plot=True to prevent accidental regressions.
-        _check_to_pixel(self, polygon_stencil, wcs, bbox, max_missing=4)
+        _check_to_pixel(
+            self, polygon_stencil, _make_wcs(), backend=MaskBackend.AST, max_missing=6, max_extra=6
+        )
+
+    def test_ast_sky_region_circle_contains_center(self) -> None:
+        region = self.instance._ast_sky_region()
+        self.assertTrue(
+            region.pointinregion([self.center.getLon().asRadians(), self.center.getLat().asRadians()])
+        )
+
+    def test_to_pixel_sphgeom(self) -> None:
+        _check_to_pixel(
+            self, self.instance, _make_wcs(), backend=MaskBackend.SPHGEOM, max_missing=0, max_extra=0
+        )
+
+    def test_to_pixel_sphgeom_polygon(self) -> None:
+        polygon_stencil = self.instance.to_polygon()
+        _check_to_pixel(
+            self, polygon_stencil, _make_wcs(), backend=MaskBackend.SPHGEOM, max_missing=0, max_extra=0
+        )
 
 
-def _brute_force_stencil_array(sky_stencil: SkyStencil, wcs: SkyWcs, bbox: Box2I) -> np.ndarray:
-    """Create a boolean Numpy array of a `SkyStencil` by transforming and
-    checking every pixel within it.
+class SkyPolygonTestCase(unittest.TestCase):
+    """Tests for `SkyPolygon` orientation handling."""
 
-    Parameters
-    ----------
-    sky_stencil : `SkyStencil`
-        Stencil to create an image of.
-    wcs : `SkyWcs`
-        WCS that transforms sky coordinates to pixel coordinates.
-    bbox : `Box2I`
-        Bounding box that must contain the pixel-coordinate stencil.
+    def setUp(self) -> None:
+        self.instance = SkyCircle(LonLat.fromDegrees(12.0, 13.0), _arcsec(2.0)).to_polygon(n_vertices=8)
 
-    Returns
-    -------
-    array : `np.ndarray`
-        2-d boolean array of shape ``(bbox.getWidth(), bbox.getHeight())``.
-        `True` pixels are those whose WCS-transformed centers are within
-        ``sky_stencil``.
+    def test_ast_sky_region_polygon_contains_centroid(self) -> None:
+        region = self.instance._ast_sky_region()
+        lonlat = lsst.sphgeom.LonLat(self.instance.region.getCentroid())
+        self.assertTrue(region.pointinregion([lonlat.getLon().asRadians(), lonlat.getLat().asRadians()]))
+
+
+class BackendComparisonTestCase(unittest.TestCase):
+    """Assert the AST and sphgeom backends agree on bbox and masked pixels."""
+
+    def setUp(self) -> None:
+        self.center = LonLat.fromDegrees(12.0, 13.0)
+        self.projection = SkyProjection.from_fits_wcs(_make_wcs(), GeneralFrame(unit=u.pix))
+        self.box = TEST_BOX
+
+    def _masked_array(self, stencil: SkyStencil, backend: MaskBackend) -> tuple[np.ndarray, Box]:
+        pixel_stencil = stencil.to_pixels(self.projection, self.box, backend=backend)
+        mask = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=self.box)
+        pixel_stencil.set_mask(mask, "STENCIL")
+        return mask.get("STENCIL"), pixel_stencil.bbox
+
+    def test_backends_agree_circle(self) -> None:
+        circle = SkyCircle(self.center, _arcsec(1.0))
+        ast_mask, ast_box = self._masked_array(circle, MaskBackend.AST)
+        sph_mask, sph_box = self._masked_array(circle, MaskBackend.SPHGEOM)
+        self.assertEqual(ast_box, sph_box)
+        self.assertEqual(int(np.sum(ast_mask != sph_mask)), 0)
+
+    def test_backends_agree_polygon(self) -> None:
+        polygon = SkyCircle(self.center, _arcsec(1.0)).to_polygon()
+        ast_mask, ast_box = self._masked_array(polygon, MaskBackend.AST)
+        sph_mask, sph_box = self._masked_array(polygon, MaskBackend.SPHGEOM)
+        self.assertEqual(ast_box, sph_box)
+        self.assertLessEqual(int(np.sum(ast_mask != sph_mask)), 12)
+
+    def test_set_mask_covered_false_marks_outside(self) -> None:
+        """``set_mask(covered=False)`` flags exactly the pixels the stencil
+        does not cover, including the region of the mask outside the stencil's
+        bounding box.
+        """
+        circle = SkyCircle(self.center, _arcsec(1.0))
+        pixel_stencil = circle.to_pixels(self.projection, self.box)
+
+        inside = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=self.box)
+        pixel_stencil.set_mask(inside, "STENCIL")
+
+        outside = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=self.box)
+        pixel_stencil.set_mask(outside, "STENCIL", covered=False)
+
+        inside_arr = inside.get("STENCIL")
+        outside_arr = outside.get("STENCIL")
+        # The two planes partition the mask: every pixel is flagged in exactly
+        # one of them.
+        np.testing.assert_array_equal(outside_arr, np.logical_not(inside_arr))
+        # The stencil covers some pixels but not the whole box, so neither
+        # plane is empty.
+        self.assertTrue(inside_arr.any())
+        self.assertTrue(outside_arr.any())
+
+
+class GreatCircleCurvatureTestCase(unittest.TestCase):
+    """Polygon stencils whose great-circle edges curve in pixel space.
+
+    The other tests use a gnomonic (TAN) projection, which maps great circles
+    to exactly straight lines and so cannot exercise edge curvature.  These
+    tests use a plate-carree (CAR) projection referenced on the equator with a
+    polygon at high declination, where the great-circle edges bow well away
+    from the straight pixel-space chords joining the projected vertices.  Both
+    mask backends must follow the true great circle rather than the chord.
+
+    The vertices land exactly on pixel centers in this geometry (lon ``+/-4``
+    and ``0`` degrees, dec ``70`` and ``66`` degrees map to integer pixels at
+    this reference and scale), so the handful of pixels of residual
+    disagreement allowed by the tolerances below are the vertex pixels
+    themselves: their centers sit exactly on the polygon boundary, where
+    containment is a tie that each backend's edge test resolves differently.
+    Vertices at generic sub-pixel positions would typically agree exactly.
     """
-    # Make Numpy arrays of the pixel coordinates.
-    x1 = np.arange(bbox.getBeginX(), bbox.getEndX())
-    y1 = np.arange(bbox.getBeginY(), bbox.getEndY())
-    x2, y2 = np.meshgrid(x1, y1)
-    # Stuff those into one (2, nPoints) array so we can pass it to the AST
-    # mapping inside a WCS.
-    pixels = np.zeros((2, bbox.getArea()), dtype=float)
-    pixels[0, :] = x2.flatten()
-    pixels[1, :] = y2.flatten()
-    # Transform all those points to sky coordinates, yielding another
-    # (2, nPoint) array.
-    sky = wcs.getTransform().getMapping().applyForward(pixels)
-    # Test which of those points are inside the sky stencil's sphgeom region,
-    # and reshape back to image coordinates.
-    contained = sky_stencil.region.contains(sky[0, :], sky[1, :])
-    # Reshape the boolean 'contained' array back to an image and return it.
-    return contained.reshape(bbox.getHeight(), bbox.getWidth())
+
+    def setUp(self) -> None:
+        self.wcs = _make_car_wcs()
+        self.projection = SkyProjection.from_fits_wcs(self.wcs, GeneralFrame(unit=u.pix))
+        self.polygon = SkyPolygon(
+            [
+                LonLat.fromDegrees(-4.0, 70.0),
+                LonLat.fromDegrees(4.0, 70.0),
+                LonLat.fromDegrees(0.0, 66.0),
+            ]
+        )
+        # The tight pixel bounding box is backend-independent, so any backend
+        # may be used to obtain it from a generous reference box.
+        self.box = self.polygon.to_pixels(self.projection, Box.factory[-10000:10000, -10000:10000]).bbox
+
+    def _coverage(self, backend: MaskBackend) -> np.ndarray:
+        pixel_stencil = self.polygon.to_pixels(self.projection, self.box, backend=backend)
+        mask = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=self.box)
+        pixel_stencil.set_mask(mask, "STENCIL")
+        return mask.get("STENCIL")
+
+    def test_scenario_exercises_curvature(self) -> None:
+        """The true spherical coverage differs substantially from a straight-
+        edged pixel-space approximation, so the backend checks below are a
+        meaningful test of great-circle handling rather than vacuously true.
+        """
+        truth = _brute_force_stencil_array(self.polygon, self.wcs, self.box)
+        cartesian = _cartesian_pixel_coverage(self.polygon, self.wcs, self.box)
+        self.assertGreater(int(np.sum(truth != cartesian)), 500)
+
+    def test_ast_backend_follows_great_circle(self) -> None:
+        # Only the three vertex pixels may disagree (see class docstring); a
+        # larger count would mean the edges were rasterized as straight pixel
+        # chords, as happens under AST's default ``SimpVertices=1``.
+        truth = _brute_force_stencil_array(self.polygon, self.wcs, self.box)
+        got = self._coverage(MaskBackend.AST)
+        self.assertLessEqual(int(np.sum(got != truth)), 3)
+
+    def test_sphgeom_backend_follows_great_circle(self) -> None:
+        truth = _brute_force_stencil_array(self.polygon, self.wcs, self.box)
+        got = self._coverage(MaskBackend.SPHGEOM)
+        self.assertLessEqual(int(np.sum(got != truth)), 3)
+
+
+def _brute_force_stencil_array(sky_stencil: SkyStencil, wcs: astropy.wcs.WCS, box: Box) -> np.ndarray:
+    """Make a boolean ``(ny, nx)`` array, `True` where a center is inside.
+
+    The pixel grid is transformed to the sky with the FITS WCS (independent of
+    the `SkyProjection` under test) and tested against the stencil's sphgeom
+    region.
+    """
+    grid = box.meshgrid()
+    sky = wcs.pixel_to_world(grid.x.ravel(), grid.y.ravel())
+    contained = sky_stencil.region.contains(sky.ra.rad, sky.dec.rad)
+    return contained.reshape(box.shape)
+
+
+def _cartesian_pixel_coverage(polygon: SkyPolygon, wcs: astropy.wcs.WCS, box: Box) -> np.ndarray:
+    """Make a boolean ``(ny, nx)`` array for the polygon with straight edges.
+
+    The vertices are projected to pixels and joined by straight chords (a
+    convex point-in-polygon test).  This models the cartesian rasterization
+    that ignores great-circle curvature, so it can be compared against the
+    true spherical coverage to show the curved scenario is non-trivial.
+    """
+    vertices = polygon._boundary_skycoord()
+    vx, vy = wcs.world_to_pixel_values(vertices.ra.deg, vertices.dec.deg)
+    grid = box.meshgrid()
+    px = grid.x.ravel().astype(float)
+    py = grid.y.ravel().astype(float)
+    n = len(vx)
+    cross = np.array(
+        [
+            (vx[(i + 1) % n] - vx[i]) * (py - vy[i]) - (vy[(i + 1) % n] - vy[i]) * (px - vx[i])
+            for i in range(n)
+        ]
+    )
+    inside = np.all(cross >= 0.0, axis=0) | np.all(cross <= 0.0, axis=0)
+    return inside.reshape(box.shape)
 
 
 def _check_to_pixel(
     test_case: unittest.TestCase,
     sky_stencil: SkyStencil,
-    wcs: SkyWcs,
-    bbox: Box2I,
+    wcs: astropy.wcs.WCS,
     *,
+    box: Box = TEST_BOX,
+    expected_bbox: Box | None = None,
+    backend: MaskBackend = MaskBackend.AST,
     max_missing: int = 0,
     max_extra: int = 0,
     plot: bool = False,
 ) -> None:
-    """Test helper function that checks a `SkyStencil.to_pixel` implementation.
+    """Check a `SkyStencil.to_pixels` result against brute force.
 
-    Parameters
-    ----------
-    test_case : `unittest.TestCase`
-        Test case object that provides assertion methods.
-    sky_stencil : `SkyStencil`
-        Stencil to test.
-    wcs : `SkyWcs`
-        WCS that transforms sky coordinates to pixel coordinates.
-    bbox : `Box2I`
-        Bounding box that must contain the pixel-coordinate stencil.
-    max_missing : `int`, optional
-        The number of WCS-transformed pixels that are in the stencil but not
-        masked by `PixelStencil.set_mask` must not exceed this number (defaults
-        to 0).
-    max_extra : `int`, optional
-        The number of WCS-transformed pixels that are not in the stencil but
-        are masked by `PixelStencil.set_mask` must not exceed this number
-        (defaults to 0).
-    plot : `bool`, optional
-        If `True` (`False` is default), create an interactive matplotlib image
-        of the comparison for human inspection.  This should never be set
-        except when debugging or actively developing a new test, and even then
-        it probably requires that the test not be run by pytest.
+    ``box`` is the reference bounding box passed to `to_pixels`; when it does
+    not fully contain the stencil the result is clipped to it.  Brute force is
+    evaluated over ``box`` too, which yields the correct expected coverage for
+    a clipped stencil: a pixel that is inside the region and inside ``box`` is
+    necessarily inside the clipped bounding box, since the region is contained
+    by its own tight bounding box.  ``expected_bbox``, if given, is asserted to
+    equal the clipped result bounding box.
     """
-    pixel_stencil = sky_stencil.to_pixels(wcs, bbox)
-    test_case.assertTrue(bbox.contains(pixel_stencil.bbox))
-    mask = Mask(bbox)
-    mask.addMaskPlane("STENCIL")
-    bits = mask.getPlaneBitMask("STENCIL")
-    pixel_stencil.set_mask(mask, bits)
-    check_array = _brute_force_stencil_array(sky_stencil, wcs, bbox)
-    missing = np.logical_and(check_array, np.logical_not(mask.array & bits))
-    extra = np.logical_and(mask.array & bits, np.logical_not(check_array))
+    projection = SkyProjection.from_fits_wcs(wcs, GeneralFrame(unit=u.pix))
+    pixel_stencil = sky_stencil.to_pixels(projection, box, backend=backend)
+    test_case.assertTrue(box.contains(pixel_stencil.bbox))
+    if expected_bbox is not None:
+        test_case.assertEqual(pixel_stencil.bbox, expected_bbox)
+    mask = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=box)
+    pixel_stencil.set_mask(mask, "STENCIL")
+    got = mask.get("STENCIL")
+    check_array = _brute_force_stencil_array(sky_stencil, wcs, box)
+    missing = np.logical_and(check_array, np.logical_not(got))
+    extra = np.logical_and(got, np.logical_not(check_array))
     if plot:
         from matplotlib import pyplot
 
-        display_array = np.zeros((bbox.getHeight(), bbox.getWidth(), 3), dtype=np.uint8)
+        display_array = np.zeros((box.shape.y, box.shape.x, 3), dtype=np.uint8)
         display_array[:, :, 0] = 255 * check_array
-        display_array[:, :, 1] = 255 * (mask.array & bits).astype(bool)
+        display_array[:, :, 1] = 255 * got
         pyplot.imshow(display_array, origin="lower", interpolation="nearest")
         pyplot.title("red=check, green=SkyStencil.to_pixel, yellow=both")
         pyplot.show()
-    test_case.assertLessEqual(sum(missing.flatten()), max_missing)
-    test_case.assertLessEqual(sum(extra.flatten()), max_extra)
+    test_case.assertLessEqual(int(missing.sum()), max_missing)
+    test_case.assertLessEqual(int(extra.sum()), max_extra)
+
+
+class StencilContainmentTestCase(unittest.TestCase):
+    """Clipping and raising when a stencil only partially overlaps, or does not
+    overlap at all, the reference bounding box passed to `to_pixels`.
+
+    The 1 arcsec circle used throughout has the fixed tight pixel bounding box
+    ``Box.factory[-3:18, -5:16]`` under `_make_wcs`, so the reference boxes
+    below produce exactly predictable intersections.
+    """
+
+    # Reference boxes relative to the circle's tight pixel bbox
+    # [y=-3:18, x=-5:16].
+    PARTIAL_BOX = Box.factory[5:30, 5:30]
+    PARTIAL_CLIPPED = Box.factory[5:18, 5:16]
+    INSIDE_STENCIL_BOX = Box.factory[12:18, 12:16]
+    TOUCHING_BOX = Box.factory[-3:18, 16:30]
+    DISJOINT_BOX = Box.factory[100:120, 100:120]
+
+    # Per-backend rasterization tolerance, matching the existing circle tests.
+    BACKEND_TOLERANCE = {MaskBackend.AST: 2, MaskBackend.SPHGEOM: 0}
+
+    def setUp(self) -> None:
+        self.center = LonLat.fromDegrees(12.0, 13.0)
+        self.wcs = _make_wcs()
+        self.projection = SkyProjection.from_fits_wcs(self.wcs, GeneralFrame(unit=u.pix))
+
+    def _circle(self, *, clip: bool) -> SkyCircle:
+        return SkyCircle(self.center, _arcsec(1.0), clip=clip)
+
+    # Box resolution happens in `to_pixels` before any mask backend is
+    # selected, so the raising behavior is backend-independent; the default
+    # backend is sufficient for the raising tests below.
+
+    def test_clip_false_raises_on_partial_overlap(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=False).to_pixels(self.projection, self.PARTIAL_BOX)
+
+    def test_clip_false_raises_when_box_inside_stencil(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=False).to_pixels(self.projection, self.INSIDE_STENCIL_BOX)
+
+    def test_clip_false_raises_when_disjoint(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=False).to_pixels(self.projection, self.DISJOINT_BOX)
+
+    def test_clip_true_raises_when_touching(self) -> None:
+        # The box starts one pixel beyond the tight bbox's max x, so the two
+        # share no pixel and clipping cannot produce an overlap.
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=True).to_pixels(self.projection, self.TOUCHING_BOX)
+
+    def test_clip_true_raises_when_disjoint(self) -> None:
+        with self.assertRaises(StencilNotContainedError):
+            self._circle(clip=True).to_pixels(self.projection, self.DISJOINT_BOX)
+
+    def test_clip_true_unchanged_when_contained(self) -> None:
+        # A fully contained stencil keeps its tight bbox even when clipping.
+        for backend, tolerance in self.BACKEND_TOLERANCE.items():
+            with self.subTest(backend=str(backend)):
+                _check_to_pixel(
+                    self,
+                    self._circle(clip=True),
+                    self.wcs,
+                    box=TEST_BOX,
+                    expected_bbox=Box.factory[-3:18, -5:16],
+                    backend=backend,
+                    max_missing=tolerance,
+                    max_extra=tolerance,
+                )
+
+    def test_clip_true_clips_to_intersection_on_partial_overlap(self) -> None:
+        for backend, tolerance in self.BACKEND_TOLERANCE.items():
+            with self.subTest(backend=str(backend)):
+                _check_to_pixel(
+                    self,
+                    self._circle(clip=True),
+                    self.wcs,
+                    box=self.PARTIAL_BOX,
+                    expected_bbox=self.PARTIAL_CLIPPED,
+                    backend=backend,
+                    max_missing=tolerance,
+                    max_extra=tolerance,
+                )
+
+    def test_clip_true_clips_to_box_when_box_inside_stencil(self) -> None:
+        for backend, tolerance in self.BACKEND_TOLERANCE.items():
+            with self.subTest(backend=str(backend)):
+                _check_to_pixel(
+                    self,
+                    self._circle(clip=True),
+                    self.wcs,
+                    box=self.INSIDE_STENCIL_BOX,
+                    expected_bbox=self.INSIDE_STENCIL_BOX,
+                    backend=backend,
+                    max_missing=tolerance,
+                    max_extra=tolerance,
+                )
+
+
+class StencilFitsMetadataTestCase(unittest.TestCase):
+    """`SkyStencil.to_fits_metadata` returns an `astropy.io.fits.Header` whose
+    cards carry the descriptive comments.
+    """
+
+    def test_circle(self) -> None:
+        circle = SkyCircle(LonLat.fromDegrees(12.0, 13.0), _arcsec(1.0))
+        header = circle.to_fits_metadata()
+        self.assertIsInstance(header, astropy.io.fits.Header)
+        self.assertEqual(header["ST_TYPE"], "CIRCLE")
+        self.assertEqual(header.comments["ST_TYPE"], "Type of stencil used to create this cutout")
+        self.assertAlmostEqual(header["ST_RA"], 12.0)
+        self.assertAlmostEqual(header["ST_DEC"], 13.0)
+        self.assertAlmostEqual(header["ST_RAD"], (1.0 * u.arcsec).to_value(u.deg))
+        self.assertEqual(header.comments["ST_RAD"], "[deg] Circle radius")
+
+    def test_polygon(self) -> None:
+        polygon = SkyCircle(LonLat.fromDegrees(12.0, 13.0), _arcsec(2.0)).to_polygon(n_vertices=4)
+        header = polygon.to_fits_metadata()
+        self.assertIsInstance(header, astropy.io.fits.Header)
+        self.assertEqual(header["ST_TYPE"], "POLYGON")
+        self.assertEqual(header.comments["ST_TYPE"], "Type of stencil used to create this cutout")
+        self.assertIn("ST_RA00", header)
+        self.assertIn("ST_DEC00", header)
+        self.assertEqual(header.comments["ST_RA00"], "[deg] Vertex 0 Right Ascension")
+        self.assertEqual(header.comments["ST_DEC00"], "[deg] Vertex 0 Declination")
 
 
 if __name__ == "__main__":
