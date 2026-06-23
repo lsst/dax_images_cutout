@@ -133,7 +133,9 @@ class Extraction:
             mask = self.cutout.mask
             # Create the new plane if it's not there.
             if name not in mask.schema.names:
-                mask.add_plane(name, "Pixel lies outside the stencil")
+                # Adding a plane creates a whole new mask.
+                mask = mask.add_plane(name, "Pixel lies outside the stencil")
+                self.cutout.mask = mask
             self.pixel_stencil.set_mask(mask, name, covered=False)
             self._record_legacy_mask_plane(self.cutout, name)
             return
