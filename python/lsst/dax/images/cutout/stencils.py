@@ -506,6 +506,13 @@ class SkyPolygon(SkyStencil):
         # vertices instead to obtain a region whose interior is the polygon.
         if not polygon.pointinregion(probe):
             polygon = Ast.Polygon(sky_frame, np.array([ra[::-1], dec[::-1]]))
+        # ``Region.mask`` rasterizes by simplifying the region into the pixel
+        # frame.  By default AST re-fits the polygon to straight-edged
+        # pixel-space vertices, discarding the great-circle curvature of the
+        # edges whenever the sky-to-pixel projection is non-gnomonic.
+        # ``SimpVertices=0`` makes AST keep the curved edges unless they match
+        # the straight approximation to within the region's uncertainty.
+        polygon.set("SimpVertices=0")
         return polygon
 
     def _boundary_skycoord(self) -> SkyCoord:

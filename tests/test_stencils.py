@@ -33,6 +33,7 @@ import lsst.sphgeom
 from lsst.dax.images.cutout.stencils import (
     MaskBackend,
     SkyCircle,
+    SkyPolygon,
     SkyStencil,
     StencilNotContainedError,
 )
@@ -62,6 +63,23 @@ def _make_wcs() -> astropy.wcs.WCS:
     scale = 0.1 / 3600.0
     wcs.wcs.cd = [[-scale, 0.0], [0.0, scale]]
     wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    return wcs
+
+
+def _make_car_wcs() -> astropy.wcs.WCS:
+    """Build a plate-carree (CAR) WCS referenced on the equator.
+
+    CAR is non-gnomonic, so great circles do not map to straight lines in
+    pixel space.  The equatorial reference keeps pixel coordinates a simple
+    (lon, lat) grid; a polygon placed at high declination then has edges that
+    bow well away from the straight chords joining its projected vertices.
+    """
+    wcs = astropy.wcs.WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    scale = 0.02
+    wcs.wcs.cd = [[-scale, 0.0], [0.0, scale]]
+    wcs.wcs.ctype = ["RA---CAR", "DEC--CAR"]
     return wcs
 
 
@@ -186,6 +204,68 @@ class BackendComparisonTestCase(unittest.TestCase):
         self.assertTrue(outside_arr.any())
 
 
+class GreatCircleCurvatureTestCase(unittest.TestCase):
+    """Polygon stencils whose great-circle edges curve in pixel space.
+
+    The other tests use a gnomonic (TAN) projection, which maps great circles
+    to exactly straight lines and so cannot exercise edge curvature.  These
+    tests use a plate-carree (CAR) projection referenced on the equator with a
+    polygon at high declination, where the great-circle edges bow well away
+    from the straight pixel-space chords joining the projected vertices.  Both
+    mask backends must follow the true great circle rather than the chord.
+
+    The vertices land exactly on pixel centers in this geometry (lon ``+/-4``
+    and ``0`` degrees, dec ``70`` and ``66`` degrees map to integer pixels at
+    this reference and scale), so the handful of pixels of residual
+    disagreement allowed by the tolerances below are the vertex pixels
+    themselves: their centers sit exactly on the polygon boundary, where
+    containment is a tie that each backend's edge test resolves differently.
+    Vertices at generic sub-pixel positions would typically agree exactly.
+    """
+
+    def setUp(self) -> None:
+        self.wcs = _make_car_wcs()
+        self.projection = SkyProjection.from_fits_wcs(self.wcs, GeneralFrame(unit=u.pix))
+        self.polygon = SkyPolygon(
+            [
+                LonLat.fromDegrees(-4.0, 70.0),
+                LonLat.fromDegrees(4.0, 70.0),
+                LonLat.fromDegrees(0.0, 66.0),
+            ]
+        )
+        # The tight pixel bounding box is backend-independent, so any backend
+        # may be used to obtain it from a generous reference box.
+        self.box = self.polygon.to_pixels(self.projection, Box.factory[-10000:10000, -10000:10000]).bbox
+
+    def _coverage(self, backend: MaskBackend) -> np.ndarray:
+        pixel_stencil = self.polygon.to_pixels(self.projection, self.box, backend=backend)
+        mask = Mask(schema=MaskSchema([MaskPlane("STENCIL", "stencil coverage")]), bbox=self.box)
+        pixel_stencil.set_mask(mask, "STENCIL")
+        return mask.get("STENCIL")
+
+    def test_scenario_exercises_curvature(self) -> None:
+        """The true spherical coverage differs substantially from a straight-
+        edged pixel-space approximation, so the backend checks below are a
+        meaningful test of great-circle handling rather than vacuously true.
+        """
+        truth = _brute_force_stencil_array(self.polygon, self.wcs, self.box)
+        cartesian = _cartesian_pixel_coverage(self.polygon, self.wcs, self.box)
+        self.assertGreater(int(np.sum(truth != cartesian)), 500)
+
+    def test_ast_backend_follows_great_circle(self) -> None:
+        # Only the three vertex pixels may disagree (see class docstring); a
+        # larger count would mean the edges were rasterized as straight pixel
+        # chords, as happens under AST's default ``SimpVertices=1``.
+        truth = _brute_force_stencil_array(self.polygon, self.wcs, self.box)
+        got = self._coverage(MaskBackend.AST)
+        self.assertLessEqual(int(np.sum(got != truth)), 3)
+
+    def test_sphgeom_backend_follows_great_circle(self) -> None:
+        truth = _brute_force_stencil_array(self.polygon, self.wcs, self.box)
+        got = self._coverage(MaskBackend.SPHGEOM)
+        self.assertLessEqual(int(np.sum(got != truth)), 3)
+
+
 def _brute_force_stencil_array(sky_stencil: SkyStencil, wcs: astropy.wcs.WCS, box: Box) -> np.ndarray:
     """Make a boolean ``(ny, nx)`` array, `True` where a center is inside.
 
@@ -197,6 +277,30 @@ def _brute_force_stencil_array(sky_stencil: SkyStencil, wcs: astropy.wcs.WCS, bo
     sky = wcs.pixel_to_world(grid.x.ravel(), grid.y.ravel())
     contained = sky_stencil.region.contains(sky.ra.rad, sky.dec.rad)
     return contained.reshape(box.shape)
+
+
+def _cartesian_pixel_coverage(polygon: SkyPolygon, wcs: astropy.wcs.WCS, box: Box) -> np.ndarray:
+    """Make a boolean ``(ny, nx)`` array for the polygon with straight edges.
+
+    The vertices are projected to pixels and joined by straight chords (a
+    convex point-in-polygon test).  This models the cartesian rasterization
+    that ignores great-circle curvature, so it can be compared against the
+    true spherical coverage to show the curved scenario is non-trivial.
+    """
+    vertices = polygon._boundary_skycoord()
+    vx, vy = wcs.world_to_pixel_values(vertices.ra.deg, vertices.dec.deg)
+    grid = box.meshgrid()
+    px = grid.x.ravel().astype(float)
+    py = grid.y.ravel().astype(float)
+    n = len(vx)
+    cross = np.array(
+        [
+            (vx[(i + 1) % n] - vx[i]) * (py - vy[i]) - (vy[(i + 1) % n] - vy[i]) * (px - vx[i])
+            for i in range(n)
+        ]
+    )
+    inside = np.all(cross >= 0.0, axis=0) | np.all(cross <= 0.0, axis=0)
+    return inside.reshape(box.shape)
 
 
 def _check_to_pixel(
