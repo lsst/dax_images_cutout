@@ -720,7 +720,7 @@ class ImageCutoutFactory:
                 kwargs={"id": str(ref.id), "cutout_mode": str(cutout_mode), "stencil": str(stencil)},
                 level=_TIMER_LOG_LEVEL,
             ):
-                with lsst.images.serialization.open(uri) as reader:
+                with lsst.images.serialization.open_archive(uri) as reader:
                     sky_projection = reader.get_component("sky_projection")
                     bbox = reader.get_component("bbox")
 

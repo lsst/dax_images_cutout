@@ -148,7 +148,7 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
                 self.assertTrue(output.exists())
 
                 # We should be able to read this back in using generic reader.
-                result = lsst.images.serialization.read(output)
+                result = lsst.images.serialization.read_archive(output)
                 self.assertIsInstance(result, lsst.images.GeneralizedImage)
 
     def test_process_uuid(self) -> None:
@@ -161,7 +161,7 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
                 self.assertTrue(output.exists())
 
                 # We should be able to read this back in using generic reader.
-                result = lsst.images.serialization.read(output)
+                result = lsst.images.serialization.read_archive(output)
                 self.assertIsInstance(result, lsst.images.GeneralizedImage)
 
     def test_provenance_in_primary_header(self):
