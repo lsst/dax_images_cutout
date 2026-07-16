@@ -23,12 +23,12 @@ import os.path
 import tempfile
 import unittest
 
+import astropy.coordinates
 import astropy.io.fits
 import astropy.units as u
 
 import lsst.images
 import lsst.images.serialization
-import lsst.sphgeom
 import lsst.utils.tests
 from lsst.daf.butler import Butler
 from lsst.dax.images.cutout import CutoutMode, ImageCutoutFactory, projection_finders, stencils
@@ -45,8 +45,8 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
         self.enterContext(self.butler)
 
         # Try: RA = 0:01:01.7  Dec = -3:02:13
-        point = lsst.sphgeom.LonLat.fromDegrees(0.25708, -3.03694)
-        radius = lsst.sphgeom.Angle((3 * u.arcsec).to_value(u.rad))
+        point = astropy.coordinates.SkyCoord(ra=0.25708 * u.deg, dec=-3.03694 * u.deg, frame="icrs")
+        radius = astropy.coordinates.Angle(3 * u.arcsec)
         self.stencil = stencils.SkyCircle(point, radius)
 
         # Projection finders are irrelevant in V2 but the constructor
@@ -126,8 +126,8 @@ class TestImageCutoutsBackendV2(lsst.utils.tests.TestCase):
         """Test that we get a truncated cutout at the edge of the image."""
         # Shift the default position slightly so we fall partly off the edge.
         # Shift Y such that the bounding box is [-17:12] vs [0:64]
-        point = lsst.sphgeom.LonLat.fromDegrees(0.25708, -3.03894)
-        radius = lsst.sphgeom.Angle((3 * u.arcsec).to_value(u.rad))
+        point = astropy.coordinates.SkyCoord(ra=0.25708 * u.deg, dec=-3.03894 * u.deg, frame="icrs")
+        radius = astropy.coordinates.Angle(3 * u.arcsec)
         self.stencil = stencils.SkyCircle(point, radius, clip=True)
 
         proj_finder = self.projectionFinders[0]

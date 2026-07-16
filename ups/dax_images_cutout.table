@@ -1,6 +1,5 @@
 # List EUPS dependencies of this package here.
 setupRequired(daf_butler)
-setupRequired(sphgeom)
 setupRequired(geom)
 setupRequired(afw)
 setupRequired(skymap)

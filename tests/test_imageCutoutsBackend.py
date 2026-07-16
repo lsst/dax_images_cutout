@@ -23,18 +23,18 @@ import os.path
 import tempfile
 import unittest
 
+import astropy.coordinates
 import astropy.io.fits
+import astropy.units as u
 import numpy as np
 
 import lsst.daf.butler
 import lsst.images
-import lsst.sphgeom
 import lsst.utils.tests
 from lsst.dax.images.cutout import CutoutMode, ImageCutoutFactory, projection_finders, stencils
 
 try:
     import lsst.afw.image
-    import lsst.geom
 
     HAVE_AFW = True
 except ImportError:
@@ -57,8 +57,8 @@ class TestImageCutoutsBackend(lsst.utils.tests.TestCase):
         self.butler = lsst.daf.butler.Butler(os.path.join(self.data_dir, "repo"), collections=collection)
 
         # Centered on a galaxy
-        point = lsst.sphgeom.LonLat.fromDegrees(56.6400770, -36.4492250)
-        radius = lsst.sphgeom.Angle((10 * lsst.geom.arcseconds).asRadians())
+        point = astropy.coordinates.SkyCoord(ra=56.6400770 * u.deg, dec=-36.4492250 * u.deg, frame="icrs")
+        radius = astropy.coordinates.Angle(10 * u.arcsec)
         self.stencil = stencils.SkyCircle(point, radius)
 
         self.projectionFinders = (
